@@ -331,6 +331,8 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     return dstPos;
 }
 
+static constexpr uint32_t wild_length = 8;
+
 uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
 {
 #ifndef NDEBUG
@@ -338,33 +340,59 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
 #endif
     uint32_t srcPos = 0;
     uint32_t dstPos = 0;
+    uint32_t dstShortEnd = dstSize - wild_length;
     while (true)
     {
         uint8_t token = src[srcPos++];
         uint32_t literal = token >> 4;
         uint32_t length = token & 0xF;
-        if (literal >= 0xF)
+        if (literal <= wild_length)
         {
-            while (true)
+            if (dstPos < dstShortEnd)
             {
-                uint8_t e = src[srcPos++];
-                literal += e;
-                if (e < 0xFF)
-                {
-                    break;
-                }
+                assert(dstPos + wild_length <= dstSize);
+                memcpy(&dst[dstPos], &src[srcPos], wild_length);
+            }
+            else
+            {
+                assert(dstPos + literal <= dstSize);
+                memcpy(&dst[dstPos], &src[srcPos], literal);
             }
         }
-        uint8_t* dstPtr;
-        const uint8_t* srcPtr;
-        dstPtr = &dst[dstPos];
-        srcPtr = &src[srcPos];
-        for (uint32_t j = 0; j < literal; ++j)
+        else
         {
-            dstPtr[j] = srcPtr[j];
+            if (literal == 0xF)
+            {
+                while (true)
+                {
+                    uint8_t e = src[srcPos++];
+                    literal += e;
+                    if (e < 0xFF)
+                    {
+                        break;
+                    }
+                }
+            }
+            uint32_t outPos = dstPos;
+            uint32_t refPos = srcPos;
+            if (dstPos + literal <= dstShortEnd)
+            {
+                for (uint32_t j = 0; j < literal; j += wild_length)
+                {
+                    assert(outPos + wild_length <= dstSize);
+                    memcpy(&dst[outPos], &src[refPos], wild_length);
+                    outPos += wild_length;
+                    refPos += wild_length;
+                }
+            }
+            else
+            {
+                assert(outPos + length <= dstSize);
+                memcpy(&dst[outPos], &src[refPos], literal);
+            }
         }
-        srcPos += literal;
         dstPos += literal;
+        srcPos += literal;
         if (dstPos == dstSize)
         {
             break;
@@ -376,29 +404,58 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
             offset |= src[srcPos++] << 7;
         }
         offset *= 8;
-        if (length >= 0xF)
+        if (length <= wild_length - 3)
         {
-            while (true)
+            length += 3;
+            uint32_t refPos = dstPos - offset;
+            if (dstPos < dstShortEnd)
             {
-                uint8_t e = src[srcPos++];
-                length += e;
-                if (e < 0xFF)
-                {
-                    break;
-                }
+                assert(dstPos + wild_length <= dstSize);
+                memcpy(&dst[dstPos], &dst[refPos], wild_length);
+            }
+            else
+            {
+                assert(dstPos + length <= dstSize);
+                memcpy(&dst[dstPos], &dst[refPos], length);
             }
         }
-        length += 3;
-        dstPtr = &dst[dstPos];
-        srcPtr = dstPtr - offset;
-        for (uint32_t j = 0; j < length; ++j)
+        else
         {
-            dstPtr[j] = srcPtr[j];
+            if (length == 0xF)
+            {
+                while (true)
+                {
+                    uint8_t e = src[srcPos++];
+                    length += e;
+                    if (e < 0xFF)
+                    {
+                        break;
+                    }
+                }
+            }
+            length += 3;
+            uint32_t outPos = dstPos;
+            uint32_t refPos = dstPos - offset;
+            if (outPos + length < dstShortEnd)
+            {
+                for (uint32_t j = 0; j < length; j += wild_length)
+                {
+                    assert(outPos + wild_length <= dstSize);
+                    memcpy(&dst[outPos], &dst[refPos], wild_length);
+                    outPos += wild_length;
+                    refPos += wild_length;
+                }
+            }
+            else
+            {
+                assert(outPos + length <= dstSize);
+                memcpy(&dst[outPos], &dst[refPos], length);
+            }
         }
+        dstPos += length;
 #ifndef NDEBUG
         fs << dstPos << ": " << length << " " << offset << endl;
 #endif
-        dstPos += length;
         if (dstPos == dstSize)
         {
             break;
