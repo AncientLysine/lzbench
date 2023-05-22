@@ -14,122 +14,15 @@ using namespace std;
 
 //3 byte variant of LZ4 for textures
 
-template<typename T, size_t capacity>
-class LZ3_stack_vector
-{
-    T count;
-    T arena[capacity];
-    unique_ptr<T[]> extra;
-
-public:
-    LZ3_stack_vector() : count(0), arena{ 0 }
-    {
-    }
-
-    void push_back(T value)
-    {
-        if (count < capacity)
-        {
-            arena[count] = value;
-            count++;
-        }
-        else
-        {
-            T alloc;
-            if (extra)
-            {
-                alloc = extra[0];
-            }
-            else
-            {
-                alloc = 32;
-                extra = make_unique<T[]>(alloc);
-                extra[0] = alloc;
-                copy(&arena[0], &arena[count], &extra[1]);
-            }
-            count++;
-            if (count >= alloc)
-            {
-                alloc *= 2;
-                auto extend = make_unique<T[]>(alloc);
-                extend[0] = alloc;
-                copy(&extra[1], &extra[count], &extend[1]);
-                extra.swap(extend);
-            }
-            extra[count] = value;
-        }
-    }
-
-    typedef const T* const_iterator;
-
-    const_iterator cbegin() const
-    {
-        if (count <= capacity)
-        {
-            return &arena[0];
-        }
-        else
-        {
-            return &extra[1];
-        }
-    }
-
-    const_iterator cend() const
-    {
-        if (count <= capacity)
-        {
-            return &arena[count];
-        }
-        else
-        {
-            return &extra[count + 1];
-        }
-    }
-};
-
 static constexpr uint32_t hash_length = 3;
-static constexpr uint32_t hash_alloca = 7;
+static constexpr uint32_t hash_size = 1024;
+static constexpr uint32_t next_height = 4;
 
-template<uint32_t capacity, uint32_t depth = 0>
-class LZ3_hash_node
+struct LZ3_hash_node
 {
-    LZ3_hash_node<capacity, depth + 1> children[capacity];
-
-public:
-    void insert(const uint8_t* sequence, uint16_t position)
-    {
-        auto& child = children[(*sequence) % capacity];
-        child.insert(sequence + 1, position);
-    }
-
-    typedef LZ3_stack_vector<uint16_t, hash_alloca>::const_iterator const_iterator;
-
-    pair<const_iterator, const_iterator> equal_range(const uint8_t* sequence) const
-    {
-        const auto& child = children[(*sequence) % capacity];
-        return child.equal_range(sequence + 1);
-    }
+    uint32_t position;
+    uint8_t next[next_height];
 };
-
-template<uint32_t capacity>
-class LZ3_hash_node<capacity, hash_length>
-{
-    LZ3_stack_vector<uint16_t, hash_alloca> positions;
-
-public:
-    void insert(const uint8_t* seq, uint16_t position)
-    {
-        positions.push_back(position);
-    }
-
-    typedef LZ3_stack_vector<uint16_t, hash_alloca>::const_iterator const_iterator;
-
-    pair<const_iterator, const_iterator> equal_range(const uint8_t* seq) const
-    {
-        return make_pair(positions.cbegin(), positions.cend());
-    }
-};
-
 
 struct LZ3_match_info
 {
@@ -139,9 +32,26 @@ struct LZ3_match_info
     uint32_t save;
 };
 
+template<typename iterator>
+uint32_t LZ3_jump_next(iterator& iter, uint32_t sure)
+{
+    sure = min(sure, hash_length + next_height - 1);
+    for (int32_t i = (int32_t)sure - hash_length; i >= 0; i--)
+    {
+        uint8_t next = iter->next[i];
+        if (next != 0)
+        {
+            iter += next;
+            return next != 0xFF ? i + hash_length : 0;
+        }
+    }
+    ++iter;
+    return 0;
+}
+
 uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
-    auto hash_table = make_unique<LZ3_hash_node<29>>();
+    vector<vector<LZ3_hash_node>> hash_chain(hash_size); //morphing match chain
     vector<uint32_t> overlap(min(srcSize, 0x1000u)); //overlap by offset / 8
     vector<LZ3_match_info> matches;
 #ifndef NDEBUG
@@ -150,26 +60,58 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     uint32_t srcPos = 0;
     for (; srcPos + hash_length - 1 < srcSize; srcPos++)
     {
-        auto equal = hash_table->equal_range(&src[srcPos]);
-        if (equal.first != equal.second)
+        uint32_t hash = { (uint32_t)((((src[srcPos] << 1) ^ src[srcPos + 1]) << 1) ^ src[srcPos + 2]) };
+        uint32_t slot = hash % hash_size;
+        vector<LZ3_hash_node>& found = hash_chain[slot];
+        if (found.size() > 0)
         {
             uint32_t offset = 0;
-            uint32_t length = 0;
+            uint32_t length = hash_length;
             uint32_t save = 0;
-            for (auto iter = equal.first; iter != equal.second; ++iter)
+            uint32_t sure = 0; //bytes sure to be matched after skip, stored in node->next
+            for (auto iter = found.rbegin(), prev = found.rend(); iter != found.rend(); sure = LZ3_jump_next(iter, sure))
             {
-                uint32_t i = *iter;
-                uint32_t o = srcPos - i;
-                if (o % 8 != 0 || o > 0x7FFF || overlap[o / 8] >= srcPos)
+                uint32_t curPos = iter->position;
+                assert(memcmp(&src[srcPos], &src[curPos], sure) == 0);
+                uint32_t o = srcPos - curPos;
+                if (o % 8 != 0)
                 {
                     continue;
                 }
-                if (memcmp(&src[srcPos], &src[i], 3) != 0)
+                uint32_t l = sure;
+                if (l < length)
+                {
+                    while (l < length && src[srcPos + l] == src[curPos + l])
+                    {
+                        l++;
+                    }
+                    if (l < length)
+                    {
+                        sure = l;
+                        continue;
+                    }
+                    uint32_t height = length - hash_length;
+                    if (height < next_height && prev != found.rend())
+                    {
+                        assert(memcmp(&src[prev->position], &src[iter->position], length) == 0);
+                        uint8_t next = (uint8_t)min<size_t>(iter - prev, 0xFF);
+                        if (next > 0)
+                        {
+                            prev->next[height] = next;
+                        }
+                    }
+                }
+                sure = length;
+                prev = iter;
+                if (o > 0x7FFF)
+                {
+                    break;
+                }
+                if (overlap[o / 8] >= srcPos)
                 {
                     continue;
                 }
-                uint32_t l = 3;
-                while (srcPos + l < srcSize && src[srcPos + l] == src[i + l])
+                while (srcPos + l < srcSize && src[srcPos + l] == src[curPos + l])
                 {
                     l++;
                 }
@@ -200,7 +142,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 }
             }
         }
-        hash_table->insert(&src[srcPos], srcPos);
+        found.push_back({ srcPos });
     }
     vector<uint32_t> filter(srcSize);
     vector<LZ3_match_info> upper;
@@ -452,10 +394,10 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
                 memcpy(&dst[outPos], &dst[refPos], length);
             }
         }
-        dstPos += length;
 #ifndef NDEBUG
         fs << dstPos << ": " << length << " " << offset << endl;
 #endif
+        dstPos += length;
         if (dstPos == dstSize)
         {
             break;
