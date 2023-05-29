@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -17,11 +18,17 @@ using namespace std;
 static constexpr uint32_t hash_length = 3;
 static constexpr uint32_t hash_size = 1024;
 static constexpr uint32_t next_height = 4;
+static constexpr uint32_t wild_length = 8;
 
 struct LZ3_hash_node
 {
     uint32_t position;
     uint8_t next[next_height];
+
+    LZ3_hash_node(uint32_t position) :
+        position(position), next{ 0 }
+    {
+    }
 };
 
 struct LZ3_match_info
@@ -30,6 +37,11 @@ struct LZ3_match_info
     uint32_t length;
     uint32_t offset;
     uint32_t save;
+
+    LZ3_match_info(uint32_t position, uint32_t length, uint32_t offset, uint32_t save):
+        position(position), length(length), offset(offset), save(save)
+    {
+    }
 };
 
 template<uint32_t length>
@@ -45,10 +57,10 @@ uint32_t LZ3_FNV_hash(const uint8_t* bytes)
 }
 
 template<typename iterator>
-uint32_t LZ3_jump_next(iterator& iter, uint32_t sure)
+uint32_t LZ3_jump_next(iterator& iter, uint32_t matched)
 {
-    sure = min(sure, hash_length + next_height - 1);
-    for (int32_t i = (int32_t)sure - hash_length; i >= 0; i--)
+    uint32_t limited = min(matched, hash_length + next_height - 1);
+    for (int32_t i = (int32_t)limited - hash_length; i >= 0; i--)
     {
         uint8_t next = iter->next[i];
         if (next != 0)
@@ -77,55 +89,71 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         vector<LZ3_hash_node>& found = hash_chain[slot];
         if (found.size() > 0)
         {
+            uint32_t length = 0;
             uint32_t offset = 0;
-            uint32_t length = hash_length;
             uint32_t save = 0;
-            uint32_t sure = 0; //bytes sure to be matched after skip, stored in node->next
+            uint32_t threshold = hash_length; //bytes match threshold to be record
+            uint32_t sure = 0; //bytes sure to be matched after skip
             for (auto iter = found.rbegin(), prev = found.rend(); iter != found.rend(); sure = LZ3_jump_next(iter, sure))
             {
                 uint32_t curPos = iter->position;
                 assert(memcmp(&src[srcPos], &src[curPos], sure) == 0);
                 uint32_t o = srcPos - curPos;
+                if (o > 0x7FFF)
+                {
+                    break;
+                }
                 if (o % 8 != 0)
                 {
                     continue;
                 }
                 uint32_t l = sure;
-                if (l < length)
+                if (l < threshold)
                 {
-                    while (l < length && src[srcPos + l] == src[curPos + l])
+                    uint32_t srcLimitEnd = min(srcSize, srcPos + threshold);
+                    while (srcPos + l < srcLimitEnd && src[srcPos + l] == src[curPos + l])
                     {
                         l++;
                     }
-                    if (l < length)
+                    if (l < threshold)
                     {
                         sure = l;
                         continue;
                     }
-                    uint32_t height = length - hash_length;
+                    uint32_t height = threshold - hash_length;
                     if (height < next_height && prev != found.rend())
                     {
-                        assert(memcmp(&src[prev->position], &src[iter->position], length) == 0);
+                        assert(memcmp(&src[prev->position], &src[iter->position], threshold) == 0);
                         uint8_t next = (uint8_t)min<size_t>(iter - prev, 0xFF);
                         if (next > 0)
                         {
+                            //assert(prev->next[height] == 0);
                             prev->next[height] = next;
                         }
                     }
                 }
-                sure = length;
                 prev = iter;
-                if (o > 0x7FFF)
-                {
-                    break;
-                }
                 if (overlap[o / 8] >= srcPos)
                 {
+                    sure = l;
                     continue;
                 }
-                while (srcPos + l < srcSize && src[srcPos + l] == src[curPos + l])
                 {
-                    l++;
+                    uint32_t srcShortEnd = srcSize - wild_length + 1;
+                    while (srcPos + l < srcShortEnd && memcmp(&src[srcPos + l], &src[curPos + l], wild_length) == 0)
+                    {
+                        l += wild_length;
+                    }
+                    uint32_t srcExactEnd = srcSize;
+                    while (srcPos + l < srcExactEnd && src[srcPos + l] == src[curPos + l])
+                    {
+                        l++;
+                    }
+                    sure = l;
+                }
+                if (threshold < l)
+                {
+                    threshold = min(l, hash_length + next_height - 1);
                 }
                 uint32_t h = o / 8 > 0x7F ? 3 : 2;
                 if (l <= h)
@@ -142,7 +170,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             }
             if (save > 0)
             {
-                matches.push_back({ srcPos, length, offset, save });
+                matches.emplace_back(srcPos, length, offset, save);
 #ifndef NDEBUG
                 fs << srcPos << ": " << length << " " << offset << endl;
 #endif
@@ -154,7 +182,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 }
             }
         }
-        found.push_back({ srcPos });
+        found.emplace_back(srcPos);
     }
     vector<uint32_t> filter(srcSize);
     vector<LZ3_match_info> upper;
@@ -227,7 +255,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             uint32_t literal = match.position - srcPos;
             uint32_t length = match.length;
             uint32_t offset = match.offset;
-            length -= 3;
+            length -= hash_length;
             offset /= 8;
             dst[dstPos++] = (uint8_t)(((literal >= 0xF ? 0xF : literal) << 4) | (length >= 0xF ? 0xF : length));
             for (int32_t e = (int32_t)literal - 0xF; e >= 0; e -= 0xFF)
@@ -285,7 +313,16 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     return dstPos;
 }
 
-static constexpr uint32_t wild_length = 8;
+uint32_t LZ3_read_VL16(const uint8_t* src, uint32_t& srcPos)
+{
+    uint32_t var = src[srcPos++];
+    if (var & 0x80)
+    {
+        var &= 0x7F;
+        var |= src[srcPos++] << 7;
+    }
+    return var;
+}
 
 uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
 {
@@ -341,8 +378,8 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
             }
             else
             {
-                assert(outPos + length <= dstSize);
-                memcpy(&dst[outPos], &src[refPos], literal);
+                assert(dstPos + literal <= dstSize);
+                memcpy(&dst[dstPos], &src[srcPos], literal);
             }
         }
         dstPos += literal;
@@ -358,9 +395,9 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
             offset |= src[srcPos++] << 7;
         }
         offset *= 8;
-        if (length <= wild_length - 3)
+        if (length <= wild_length - hash_length)
         {
-            length += 3;
+            length += hash_length;
             uint32_t refPos = dstPos - offset;
             if (dstPos < dstShortEnd)
             {
@@ -387,7 +424,7 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
                     }
                 }
             }
-            length += 3;
+            length += hash_length;
             uint32_t outPos = dstPos;
             uint32_t refPos = dstPos - offset;
             if (outPos + length < dstShortEnd)
@@ -402,8 +439,11 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
             }
             else
             {
-                assert(outPos + length <= dstSize);
-                memcpy(&dst[outPos], &dst[refPos], length);
+                for (uint32_t j = 0; j < length; j++)
+                {
+                    assert(outPos < dstSize);
+                    dst[outPos++] = dst[refPos++];
+                }
             }
         }
 #ifndef NDEBUG
