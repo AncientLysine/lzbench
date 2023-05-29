@@ -32,6 +32,18 @@ struct LZ3_match_info
     uint32_t save;
 };
 
+template<uint32_t length>
+uint32_t LZ3_FNV_hash(const uint8_t* bytes)
+{
+    uint32_t hash = 0x811c9dc5;
+    for (uint32_t i = 0; i < length; i++)
+    {
+        hash ^= bytes[i];
+        hash *= 0x01000193;
+    }
+    return hash;
+}
+
 template<typename iterator>
 uint32_t LZ3_jump_next(iterator& iter, uint32_t sure)
 {
@@ -60,7 +72,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     uint32_t srcPos = 0;
     for (; srcPos + hash_length - 1 < srcSize; srcPos++)
     {
-        uint32_t hash = { (uint32_t)((((src[srcPos] << 1) ^ src[srcPos + 1]) << 1) ^ src[srcPos + 2]) };
+        uint32_t hash = LZ3_FNV_hash<hash_length>(&src[srcPos]);
         uint32_t slot = hash % hash_size;
         vector<LZ3_hash_node>& found = hash_chain[slot];
         if (found.size() > 0)
