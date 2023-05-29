@@ -331,23 +331,33 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
 #endif
     uint32_t srcPos = 0;
     uint32_t dstPos = 0;
-    uint32_t dstShortEnd = dstSize - wild_length;
+    uint32_t dstShortEnd = dstSize - 14 - 16;
     while (true)
     {
         uint8_t token = src[srcPos++];
         uint32_t literal = token >> 4;
         uint32_t length = token & 0xF;
-        if (literal <= wild_length)
+        uint32_t offset;
+        if (literal <= 14 && dstPos < dstShortEnd)
         {
-            if (dstPos < dstShortEnd)
+            assert(dstPos + wild_length <= dstSize);
+            memcpy(&dst[dstPos], &src[srcPos], 16);
+            dstPos += literal;
+            srcPos += literal;
+            if (dstPos == dstSize)
             {
-                assert(dstPos + wild_length <= dstSize);
-                memcpy(&dst[dstPos], &src[srcPos], wild_length);
+                break;
             }
-            else
+            offset = LZ3_read_VL16(src, srcPos);
+            offset *= 8;
+            if (length <= 16 - hash_length)
             {
-                assert(dstPos + literal <= dstSize);
-                memcpy(&dst[dstPos], &src[srcPos], literal);
+                length += hash_length;
+                uint32_t refPos = dstPos - offset;
+                memcpy(&dst[dstPos + 0], &dst[refPos + 0], 8);
+                memcpy(&dst[dstPos + 8], &dst[refPos + 8], 8);
+                dstPos += length;
+                continue;
             }
         }
         else
@@ -381,36 +391,15 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
                 assert(dstPos + literal <= dstSize);
                 memcpy(&dst[dstPos], &src[srcPos], literal);
             }
-        }
-        dstPos += literal;
-        srcPos += literal;
-        if (dstPos == dstSize)
-        {
-            break;
-        }
-        uint32_t offset = src[srcPos++];
-        if (offset & 0x80)
-        {
-            offset &= 0x7F;
-            offset |= src[srcPos++] << 7;
-        }
-        offset *= 8;
-        if (length <= wild_length - hash_length)
-        {
-            length += hash_length;
-            uint32_t refPos = dstPos - offset;
-            if (dstPos < dstShortEnd)
+            dstPos += literal;
+            srcPos += literal;
+            if (dstPos == dstSize)
             {
-                assert(dstPos + wild_length <= dstSize);
-                memcpy(&dst[dstPos], &dst[refPos], wild_length);
+                break;
             }
-            else
-            {
-                assert(dstPos + length <= dstSize);
-                memcpy(&dst[dstPos], &dst[refPos], length);
-            }
+            offset = LZ3_read_VL16(src, srcPos);
+            offset *= 8;
         }
-        else
         {
             if (length == 0xF)
             {
