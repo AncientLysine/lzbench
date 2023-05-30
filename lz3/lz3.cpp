@@ -336,11 +336,11 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
     {
         uint8_t token = src[srcPos++];
         uint32_t literal = token >> 4;
-        uint32_t length = token & 0xF;
+        uint32_t length = (token & 0xF) + hash_length;
         uint32_t offset;
         if (literal <= 14 && dstPos < dstShortEnd)
         {
-            assert(dstPos + wild_length <= dstSize);
+            assert(dstPos + 16 <= dstSize);
             memcpy(&dst[dstPos], &src[srcPos], 16);
             dstPos += literal;
             srcPos += literal;
@@ -350,12 +350,11 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
             }
             offset = LZ3_read_VL16(src, srcPos);
             offset *= 8;
-            if (length <= 16 - hash_length)
+            if (length <= 16 && offset >= 16)
             {
-                length += hash_length;
                 uint32_t refPos = dstPos - offset;
-                memcpy(&dst[dstPos + 0], &dst[refPos + 0], 8);
-                memcpy(&dst[dstPos + 8], &dst[refPos + 8], 8);
+                assert(dstPos + 16 <= dstSize);
+                memcpy(&dst[dstPos], &dst[refPos], 16);
                 dstPos += length;
                 continue;
             }
@@ -401,7 +400,7 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
             offset *= 8;
         }
         {
-            if (length == 0xF)
+            if (length == 0xF + hash_length)
             {
                 while (true)
                 {
@@ -413,7 +412,6 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
                     }
                 }
             }
-            length += hash_length;
             uint32_t outPos = dstPos;
             uint32_t refPos = dstPos - offset;
             if (outPos + length < dstShortEnd)
