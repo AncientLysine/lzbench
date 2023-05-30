@@ -73,10 +73,38 @@ uint32_t LZ3_jump_next(iterator& iter, uint32_t matched)
     return 0;
 }
 
+void LZ3_write_VL16(uint8_t* dst, uint32_t& dstPos, uint32_t var)
+{
+    if (var % 8 != 0 || var / 8 > 0x7F)
+    {
+        dst[dstPos++] = (uint8_t)((var & 0x7F) | 0x80);
+        var >>= 7;
+        dst[dstPos++] = (uint8_t)((var & 0xFF) ^ 0x01);
+    }
+    else
+    {
+        dst[dstPos++] = (uint8_t)(var / 8);
+    }
+}
+
+uint32_t LZ3_read_VL16(const uint8_t* src, uint32_t& srcPos)
+{
+    uint32_t var = src[srcPos++];
+    if (var & 0x80)
+    {
+        var ^= src[srcPos++] << 7;
+    }
+    else
+    {
+        var *= 8;
+    }
+    return var;
+}
+
 uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
     vector<vector<LZ3_hash_node>> hash_chain(hash_size); //morphing match chain
-    vector<uint32_t> overlap(min(srcSize, 0x1000u)); //overlap by offset / 8
+    vector<uint32_t> overlap(min(srcSize, 0x8000u)); //overlap by offset
     vector<LZ3_match_info> matches;
 #ifndef NDEBUG
     ofstream fs("LZ3_compress.log");
@@ -102,10 +130,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 if (o > 0x7FFF)
                 {
                     break;
-                }
-                if (o % 8 != 0)
-                {
-                    continue;
                 }
                 uint32_t l = sure;
                 if (l < threshold)
@@ -133,7 +157,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                     }
                 }
                 prev = iter;
-                if (overlap[o / 8] >= srcPos)
+                if (overlap[o] >= srcPos)
                 {
                     sure = l;
                     continue;
@@ -155,7 +179,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 {
                     threshold = min(l, hash_length + next_height - 1);
                 }
-                uint32_t h = o / 8 > 0x7F ? 3 : 2;
+                uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
                 if (l <= h)
                 {
                     continue;
@@ -177,8 +201,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 uint32_t e = srcPos + length;
                 for (uint32_t o = offset; o <= max(length, offset); o += offset)
                 {
-                    uint32_t i = o / 8;
-                    overlap[i] = max(overlap[i], e);
+                    overlap[o] = max(overlap[o], e);
                 }
             }
         }
@@ -256,7 +279,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             uint32_t length = match.length;
             uint32_t offset = match.offset;
             length -= hash_length;
-            offset /= 8;
             dst[dstPos++] = (uint8_t)(((literal >= 0xF ? 0xF : literal) << 4) | (length >= 0xF ? 0xF : length));
             for (int32_t e = (int32_t)literal - 0xF; e >= 0; e -= 0xFF)
             {
@@ -269,15 +291,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             memcpy(&dst[dstPos], &src[srcPos], literal);
             dstPos += literal;
             srcPos += literal;
-            if (offset <= 0x7F)
-            {
-                dst[dstPos++] = (uint8_t)offset;
-            }
-            else
-            {
-                dst[dstPos++] = (uint8_t)((offset & 0x7F) | 0x80);
-                dst[dstPos++] = (uint8_t)((offset >> 7) & 0xFF);
-            }
+            LZ3_write_VL16(dst, dstPos, offset);
             for (int32_t e = (int32_t)length - 0xF; e >= 0; e -= 0xFF)
             {
                 dst[dstPos++] = (uint8_t)(e >= 0xFF ? 0xFF : e);
@@ -313,17 +327,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     return dstPos;
 }
 
-uint32_t LZ3_read_VL16(const uint8_t* src, uint32_t& srcPos)
-{
-    uint32_t var = src[srcPos++];
-    if (var & 0x80)
-    {
-        var &= 0x7F;
-        var |= src[srcPos++] << 7;
-    }
-    return var;
-}
-
 uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
 {
 #ifndef NDEBUG
@@ -344,17 +347,15 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
             memcpy(&dst[dstPos], &src[srcPos], 16);
             dstPos += literal;
             srcPos += literal;
-            if (dstPos == dstSize)
-            {
-                break;
-            }
             offset = LZ3_read_VL16(src, srcPos);
-            offset *= 8;
             if (length <= 16 && offset >= 16)
             {
                 uint32_t refPos = dstPos - offset;
                 assert(dstPos + 16 <= dstSize);
                 memcpy(&dst[dstPos], &dst[refPos], 16);
+#ifndef NDEBUG
+                fs << dstPos << ": " << length << " " << offset << endl;
+#endif
                 dstPos += length;
                 continue;
             }
@@ -397,7 +398,6 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
                 break;
             }
             offset = LZ3_read_VL16(src, srcPos);
-            offset *= 8;
         }
         {
             if (length == 0xF + hash_length)
@@ -414,7 +414,7 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
             }
             uint32_t outPos = dstPos;
             uint32_t refPos = dstPos - offset;
-            if (outPos + length < dstShortEnd)
+            if (outPos + length < dstShortEnd && offset >= wild_length)
             {
                 for (uint32_t j = 0; j < length; j += wild_length)
                 {
