@@ -184,6 +184,11 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 {
                     continue;
                 }
+                uint32_t e = srcPos + l;
+                for (uint32_t i = o; i <= max(l, o) && i < overlap.size(); i += o)
+                {
+                    overlap[i] = max(overlap[i], e);
+                }
                 uint32_t s = l - h;
                 if (save < s || (save == s && offset > o))
                 {
@@ -198,11 +203,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 #ifndef NDEBUG
                 fs << srcPos << ": " << length << " " << offset << endl;
 #endif
-                uint32_t e = srcPos + length;
-                for (uint32_t o = offset; o <= max(length, offset); o += offset)
-                {
-                    overlap[o] = max(overlap[o], e);
-                }
             }
         }
         found.emplace_back(srcPos);
@@ -283,10 +283,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             for (int32_t e = (int32_t)literal - 0xF; e >= 0; e -= 0xFF)
             {
                 dst[dstPos++] = (uint8_t)(e >= 0xFF ? 0xFF : e);
-                if (e < 0xFF)
-                {
-                    break;
-                }
             }
             memcpy(&dst[dstPos], &src[srcPos], literal);
             dstPos += literal;
@@ -295,10 +291,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             for (int32_t e = (int32_t)length - 0xF; e >= 0; e -= 0xFF)
             {
                 dst[dstPos++] = (uint8_t)(e >= 0xFF ? 0xFF : e);
-                if (e < 0xFF)
-                {
-                    break;
-                }
             }
             srcPos += match.length;
         }
@@ -310,10 +302,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         for (int32_t e = (int32_t)literal - 0xF; e >= 0; e -= 0xFF)
         {
             dst[dstPos++] = (uint8_t)(e >= 0xFF ? 0xFF : e);
-            if (e < 0xFF)
-            {
-                break;
-            }
         }
         memcpy(&dst[dstPos], &src[srcSize - literal], literal);
         dstPos += literal;
