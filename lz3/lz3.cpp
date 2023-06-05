@@ -16,14 +16,14 @@ using namespace std;
 //3 byte variant of LZ4 for textures
 
 static constexpr uint32_t hash_length = 3;
-static constexpr uint32_t hash_size = 1024;
-static constexpr uint32_t next_height = 4;
+static constexpr uint32_t hash_size = 1 << 13;
+static constexpr uint32_t next_height = 6;
 static constexpr uint32_t wild_length = 8;
 
 struct LZ3_hash_node
 {
     uint32_t position;
-    uint8_t next[next_height];
+    uint16_t next[next_height];
 
     LZ3_hash_node(uint32_t position) :
         position(position), next{ 0 }
@@ -59,14 +59,14 @@ uint32_t LZ3_FNV_hash(const uint8_t* bytes)
 template<typename iterator>
 uint32_t LZ3_jump_next(iterator& iter, uint32_t matched)
 {
-    uint32_t limited = min(matched, hash_length + next_height - 1);
-    for (int32_t i = (int32_t)limited - hash_length; i >= 0; i--)
+    uint16_t* next = &iter->next[0] - hash_length;
+    for (uint32_t i = min(matched , next_height + hash_length - 1); i >= hash_length; i--)
     {
-        uint8_t next = iter->next[i];
-        if (next != 0)
+        uint16_t n = next[i];
+        if (n != 0)
         {
-            iter += next;
-            return next != 0xFF ? i + hash_length : 0;
+            iter += n;
+            return i;
         }
     }
     ++iter;
@@ -148,7 +148,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                     if (height < next_height && prev != found.rend())
                     {
                         assert(memcmp(&src[prev->position], &src[iter->position], threshold) == 0);
-                        uint8_t next = (uint8_t)min<size_t>(iter - prev, 0xFF);
+                        uint16_t next = (uint16_t)min<size_t>(iter - prev, 0xFFFF);
                         if (next > 0)
                         {
                             //assert(prev->next[height] == 0);
