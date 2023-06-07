@@ -307,6 +307,24 @@ int64_t lzbench_lizard_decompress(char *inbuf, size_t insize, char *outbuf, size
 
 
 
+#ifndef BENCH_REMOVE_LZ3
+#include "lz3/lz3.h"
+
+int64_t lzbench_lz3_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t level, size_t, char*)
+{
+	return LZ3_compress((uint8_t*)inbuf, (uint8_t*)outbuf, (uint32_t)insize);
+}
+
+int64_t lzbench_lz3_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t, size_t, char*)
+{
+	LZ3_decompress_fast((uint8_t*)inbuf, (uint8_t*)outbuf, (uint32_t)outsize);
+    return outsize;
+}
+
+#endif
+
+
+
 #ifndef BENCH_REMOVE_LZ4
 #include "lz4/lz4.h"
 #include "lz4/lz4hc.h"
@@ -328,7 +346,8 @@ int64_t lzbench_lz4hc_compress(char *inbuf, size_t insize, char *outbuf, size_t 
 
 int64_t lzbench_lz4_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t, size_t, char*)
 {
-	return LZ4_decompress_safe(inbuf, outbuf, insize, outsize);
+	LZ4_decompress_fast(inbuf, outbuf, outsize);
+    return outsize;
 }
 
 #endif
