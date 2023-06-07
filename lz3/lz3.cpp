@@ -36,11 +36,20 @@ struct LZ3_match_info
     uint32_t position;
     uint32_t length;
     uint32_t offset;
-    uint32_t save;
 
-    LZ3_match_info(uint32_t position, uint32_t length, uint32_t offset, uint32_t save):
-        position(position), length(length), offset(offset), save(save)
+    LZ3_match_info(uint32_t position, uint32_t length, uint32_t offset) :
+        position(position), length(length), offset(offset)
     {
+    }
+
+    uint32_t header() const
+    {
+        return (offset % 8 == 0 && offset / 8 <= 0x7F) ? 2 : 3;
+    }
+
+    uint32_t save() const
+    {
+        return length - header();
     }
 };
 
@@ -60,7 +69,7 @@ template<typename iterator>
 uint32_t LZ3_jump_next(iterator& iter, uint32_t matched)
 {
     uint16_t* next = &iter->next[0] - hash_length;
-    for (uint32_t i = min(matched , next_height + hash_length - 1); i >= hash_length; i--)
+    for (uint32_t i = min(matched, next_height + hash_length - 1); i >= hash_length; i--)
     {
         uint16_t n = next[i];
         if (n != 0)
@@ -104,7 +113,7 @@ uint32_t LZ3_read_VL16(const uint8_t* src, uint32_t& srcPos)
 uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
     vector<vector<LZ3_hash_node>> hash_chain(hash_size); //morphing match chain
-    vector<uint32_t> overlap(min(srcSize, 0x8000u)); //overlap by offset
+    uint32_t overlap = 0;
     vector<LZ3_match_info> matches;
 #ifndef NDEBUG
     ofstream fs("LZ3_compress.log");
@@ -115,12 +124,9 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         uint32_t hash = LZ3_FNV_hash<hash_length>(&src[srcPos]);
         uint32_t slot = hash % hash_size;
         vector<LZ3_hash_node>& found = hash_chain[slot];
-        if (found.size() > 0)
+        if (srcPos > overlap && found.size() > 0)
         {
-            uint32_t length = 0;
-            uint32_t offset = 0;
-            uint32_t save = 0;
-            uint32_t threshold = hash_length; //bytes match threshold to be record
+            uint32_t threshold = hash_length; //bytes matched threshold to be record
             uint32_t sure = 0; //bytes sure to be matched after skip
             for (auto iter = found.rbegin(), prev = found.rend(); iter != found.rend(); sure = LZ3_jump_next(iter, sure))
             {
@@ -131,17 +137,17 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 {
                     break;
                 }
-                uint32_t l = sure;
-                if (l < threshold)
+                uint32_t f = sure; //bytes matched forward
+                if (f < threshold)
                 {
                     uint32_t srcLimitEnd = min(srcSize, srcPos + threshold);
-                    while (srcPos + l < srcLimitEnd && src[srcPos + l] == src[curPos + l])
+                    while (srcPos + f < srcLimitEnd && src[srcPos + f] == src[curPos + f])
                     {
-                        l++;
+                        f++;
                     }
-                    if (l < threshold)
+                    if (f < threshold)
                     {
-                        sure = l;
+                        sure = f;
                         continue;
                     }
                     uint32_t height = threshold - hash_length;
@@ -157,64 +163,96 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                     }
                 }
                 prev = iter;
-                if (overlap[o] >= srcPos)
                 {
-                    sure = l;
-                    continue;
-                }
-                {
+                    //match forward
                     uint32_t srcShortEnd = srcSize - wild_length + 1;
-                    while (srcPos + l < srcShortEnd && memcmp(&src[srcPos + l], &src[curPos + l], wild_length) == 0)
+                    while (srcPos + f < srcShortEnd && memcmp(&src[srcPos + f], &src[curPos + f], wild_length) == 0)
                     {
-                        l += wild_length;
+                        f += wild_length;
                     }
                     uint32_t srcExactEnd = srcSize;
-                    while (srcPos + l < srcExactEnd && src[srcPos + l] == src[curPos + l])
+                    while (srcPos + f < srcExactEnd && src[srcPos + f] == src[curPos + f])
                     {
-                        l++;
+                        f++;
                     }
-                    sure = l;
                 }
-                if (threshold < l)
+                sure = f;
+                if (threshold < f)
                 {
-                    threshold = min(l, hash_length + next_height - 1);
+                    threshold = min(f, hash_length + next_height - 1);
                 }
+                uint32_t b = 0; //bytes matched backward
+                {
+                    //match backward
+                    b += wild_length;
+                    while (curPos >= b && memcmp(&src[srcPos - b], &src[curPos - b], wild_length) == 0)
+                    {
+                        b += wild_length;
+                    }
+                    b -= wild_length;
+                    b += 1;
+                    while (curPos >= b && src[srcPos - b] == src[curPos - b])
+                    {
+                        b++;
+                    }
+                    b -= 1;
+                }
+                uint32_t p = srcPos - b;
+                uint32_t l = b + f;
                 uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
+                if (h == 2)
+                {
+                    overlap = max(overlap, (p + l) - hash_length);
+                }
                 if (l <= h)
                 {
                     continue;
                 }
-                uint32_t e = srcPos + l;
-                for (uint32_t i = o; i <= max(l, o) && i < overlap.size(); i += o)
-                {
-                    overlap[i] = max(overlap[i], e);
-                }
                 uint32_t s = l - h;
-                if (save < s || (save == s && offset > o))
+                bool assign = false;
+                auto insert = matches.begin();
+                for (auto i = matches.rbegin(); i != matches.rend(); ++i)
                 {
-                    offset = o;
-                    length = l;
-                    save = s;
+                    if (i->position == p && i->header() == h)
+                    {
+                        if (i->save() < s)
+                        {
+                            *i = { p, l, o };
+                        }
+                        assign = true;
+                        break;
+                    }
+                    if (i->position < p || (i->position == p && i->header() < h))
+                    {
+                        insert = i.base();
+                        break;
+                    }
                 }
-            }
-            if (save > 0)
-            {
-                matches.emplace_back(srcPos, length, offset, save);
-#ifndef NDEBUG
-                fs << srcPos << ": " << length << " " << offset << endl;
-#endif
+                if (!assign)
+                {
+                    matches.insert(insert, { p, l, o });
+                }
             }
         }
         found.emplace_back(srcPos);
     }
+#ifndef NDEBUG
+    for (const LZ3_match_info& match : matches)
+    {
+        uint32_t position = match.position;
+        uint32_t length = match.length;
+        uint32_t offset = match.offset;
+        fs << position << ": " << length << " " << offset << endl;
+    }
+#endif
     vector<uint32_t> filter(srcSize);
     vector<LZ3_match_info> upper;
     vector<LZ3_match_info> lower;
-    stable_sort(matches.begin(), matches.end(), [](auto x, auto y) { return x.save > y.save; });
+    stable_sort(matches.begin(), matches.end(), [](auto x, auto y) { return x.save() > y.save(); });
     for (uint32_t i = 0; i < matches.size();)
     {
         const LZ3_match_info* match;
-        if (lower.size() > 0 && lower.back().save >= matches[i].save)
+        if (lower.size() > 0 && lower.back().save() >= matches[i].save())
         {
             match = &lower.back();
             lower.pop_back();
@@ -258,12 +296,10 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             upper.push_back(*match);
             continue;
         }
-        uint32_t offset = match->offset;
-        uint32_t save = match->save;
-        if (save > head + tail)
+        if (match->save() > head + tail)
         {
-            LZ3_match_info m{ position + head, length - head - tail, offset, save - head - tail };
-            auto iter = upper_bound(lower.begin(), lower.end(), m, [](auto x, auto y) { return x.save < y.save; });
+            LZ3_match_info m{ position + head, length - head - tail, match->offset };
+            auto iter = upper_bound(lower.begin(), lower.end(), m, [](auto x, auto y) { return x.save() < y.save(); });
             lower.insert(iter, m);
         }
     }
@@ -271,7 +307,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     stable_sort(matches.begin(), matches.end(), [](auto x, auto y) { return x.position < y.position; });
     srcPos = 0;
     uint32_t dstPos = 0;
-    for (const auto& match : matches)
+    for (const LZ3_match_info& match : matches)
     {
         if (match.position >= srcPos)
         {
