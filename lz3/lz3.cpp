@@ -7,7 +7,7 @@
 #define LZ3_LIBRARY
 #include "lz3.h"
 
-#ifndef NDEBUG
+#if defined(LZ3_LOG) && !defined(NDEBUG)
 #include <fstream>
 #endif
 
@@ -115,7 +115,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     vector<vector<LZ3_hash_node>> hash_chain(hash_size); //morphing match chain
     uint32_t overlap = 0;
     vector<LZ3_match_info> matches;
-#ifndef NDEBUG
+#if defined(LZ3_LOG) && !defined(NDEBUG)
     ofstream fs("LZ3_compress.log");
 #endif
     uint32_t srcPos = 0;
@@ -236,7 +236,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         }
         found.emplace_back(srcPos);
     }
-#ifndef NDEBUG
+#if defined(LZ3_LOG) && !defined(NDEBUG)
     for (const LZ3_match_info& match : matches)
     {
         uint32_t position = match.position;
@@ -353,7 +353,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 
 uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
 {
-#ifndef NDEBUG
+#if defined(LZ3_LOG) && !defined(NDEBUG)
     ofstream fs("LZ3_decompress.log");
 #endif
     uint32_t srcPos = 0;
@@ -377,7 +377,7 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
                 uint32_t refPos = dstPos - offset;
                 assert(dstPos + 16 <= dstSize);
                 memcpy(&dst[dstPos], &dst[refPos], 16);
-#ifndef NDEBUG
+#if defined(LZ3_LOG) && !defined(NDEBUG)
                 fs << dstPos << ": " << length << " " << offset << endl;
 #endif
                 dstPos += length;
@@ -457,7 +457,7 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
                 }
             }
         }
-#ifndef NDEBUG
+#if defined(LZ3_LOG) && !defined(NDEBUG)
         fs << dstPos << ": " << length << " " << offset << endl;
 #endif
         dstPos += length;

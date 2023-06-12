@@ -6,11 +6,7 @@
 extern "C" {
 #endif
 
-#ifdef LZ3_STATIC
-
-#define LZ3_API
-
-#else
+#ifdef LZ3_SHARED
 
 #ifdef _WIN32
 
@@ -29,6 +25,10 @@ extern "C" {
 #endif
 
 #endif
+
+#else
+
+#define LZ3_API
 
 #endif
 
