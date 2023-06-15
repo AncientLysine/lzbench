@@ -17,16 +17,14 @@ using namespace std;
 
 static constexpr uint32_t hash_length = 3;
 static constexpr uint32_t hash_size = 1 << 13;
-static constexpr uint32_t next_height = 6;
 static constexpr uint32_t wild_length = 8;
 
 struct LZ3_hash_node
 {
     uint32_t position;
-    uint16_t next[next_height];
 
     LZ3_hash_node(uint32_t position) :
-        position(position), next{ 0 }
+        position(position)
     {
     }
 };
@@ -65,23 +63,6 @@ uint32_t LZ3_FNV_hash(const uint8_t* bytes)
     return hash;
 }
 
-template<typename iterator>
-uint32_t LZ3_jump_next(iterator& iter, uint32_t matched)
-{
-    uint16_t* next = &iter->next[0] - hash_length;
-    for (uint32_t i = min(matched, next_height + hash_length - 1); i >= hash_length; i--)
-    {
-        uint16_t n = next[i];
-        if (n != 0)
-        {
-            iter += n;
-            return i;
-        }
-    }
-    ++iter;
-    return 0;
-}
-
 void LZ3_write_VL16(uint8_t* dst, uint32_t& dstPos, uint32_t var)
 {
     if (var % 8 != 0 || var / 8 > 0x7F)
@@ -112,7 +93,7 @@ uint32_t LZ3_read_VL16(const uint8_t* src, uint32_t& srcPos)
 
 uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
-    vector<vector<LZ3_hash_node>> hash_chain(hash_size); //morphing match chain
+    vector<vector<LZ3_hash_node>> hash_chain(hash_size);
     uint32_t overlap = 0;
     vector<LZ3_match_info> matches;
 #if defined(LZ3_LOG) && !defined(NDEBUG)
@@ -126,43 +107,15 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         vector<LZ3_hash_node>& found = hash_chain[slot];
         if (srcPos > overlap && found.size() > 0)
         {
-            uint32_t threshold = hash_length; //bytes matched threshold to be record
-            uint32_t sure = 0; //bytes sure to be matched after skip
-            for (auto iter = found.rbegin(), prev = found.rend(); iter != found.rend(); sure = LZ3_jump_next(iter, sure))
+            for (auto iter = found.rbegin(); iter != found.rend(); ++iter)
             {
                 uint32_t curPos = iter->position;
-                assert(memcmp(&src[srcPos], &src[curPos], sure) == 0);
                 uint32_t o = srcPos - curPos;
                 if (o > 0x7FFF)
                 {
                     break;
                 }
-                uint32_t f = sure; //bytes matched forward
-                if (f < threshold)
-                {
-                    uint32_t srcLimitEnd = min(srcSize, srcPos + threshold);
-                    while (srcPos + f < srcLimitEnd && src[srcPos + f] == src[curPos + f])
-                    {
-                        f++;
-                    }
-                    if (f < threshold)
-                    {
-                        sure = f;
-                        continue;
-                    }
-                    uint32_t height = threshold - hash_length;
-                    if (height < next_height && prev != found.rend())
-                    {
-                        assert(memcmp(&src[prev->position], &src[iter->position], threshold) == 0);
-                        uint16_t next = (uint16_t)min<size_t>(iter - prev, 0xFFFF);
-                        if (next > 0)
-                        {
-                            //assert(prev->next[height] == 0);
-                            prev->next[height] = next;
-                        }
-                    }
-                }
-                prev = iter;
+                uint32_t f = 0; //bytes matched forward
                 {
                     //match forward
                     uint32_t srcShortEnd = srcSize - wild_length + 1;
@@ -175,11 +128,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                     {
                         f++;
                     }
-                }
-                sure = f;
-                if (threshold < f)
-                {
-                    threshold = min(f, hash_length + next_height - 1);
                 }
                 uint32_t b = 0; //bytes matched backward
                 {
@@ -200,13 +148,13 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 uint32_t p = srcPos - b;
                 uint32_t l = b + f;
                 uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
-                if (h == 2)
-                {
-                    overlap = max(overlap, (p + l) - hash_length);
-                }
                 if (l <= h)
                 {
                     continue;
+                }
+                if (h == 2)
+                {
+                    overlap = max(overlap, (p + l) - hash_length);
                 }
                 uint32_t s = l - h;
                 bool assign = false;
