@@ -16,7 +16,7 @@ using namespace std;
 //3 byte variant of LZ4 for textures
 
 static constexpr uint32_t hash_length = 3;
-static constexpr uint32_t hash_size = 1 << 13;
+static constexpr uint32_t hash_bucket = 1 << 13;
 static constexpr uint32_t wild_length = 8;
 
 struct LZ3_hash_node
@@ -93,8 +93,9 @@ uint32_t LZ3_read_VL16(const uint8_t* src, uint32_t& srcPos)
 
 uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
-    vector<vector<LZ3_hash_node>> hash_chain(hash_size);
-    uint32_t overlap = 0;
+    vector<vector<LZ3_hash_node>> bytes_hash(hash_bucket);
+    uint32_t outer_skip = 0;
+    uint32_t inner_skip = 0;
     vector<LZ3_match_info> matches;
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     ofstream fs("LZ3_compress.log");
@@ -103,10 +104,12 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     for (; srcPos + hash_length - 1 < srcSize; srcPos++)
     {
         uint32_t hash = LZ3_FNV_hash<hash_length>(&src[srcPos]);
-        uint32_t slot = hash % hash_size;
-        vector<LZ3_hash_node>& found = hash_chain[slot];
-        if (srcPos > overlap && found.size() > 0)
+        uint32_t slot = hash % hash_bucket;
+        vector<LZ3_hash_node>& found = bytes_hash[slot];
+        if (srcPos > outer_skip && found.size() > 0)
         {
+        LZ3_restart_search:
+            uint32_t inner_temp = inner_skip;
             for (auto iter = found.rbegin(); iter != found.rend(); ++iter)
             {
                 uint32_t curPos = iter->position;
@@ -114,6 +117,11 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 if (o > 0x7FFF)
                 {
                     break;
+                }
+                uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
+                if (h != 2 && srcPos <= inner_temp)
+                {
+                    continue;
                 }
                 uint32_t f = 0; //bytes matched forward
                 {
@@ -147,14 +155,23 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 }
                 uint32_t p = srcPos - b;
                 uint32_t l = b + f;
-                uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
                 if (l <= h)
                 {
                     continue;
                 }
+                uint32_t skip = (p + l) - hash_length;
                 if (h == 2)
                 {
-                    overlap = max(overlap, (p + l) - hash_length);
+                    outer_skip = max(outer_skip, skip);
+                    if (inner_temp != 0 && outer_skip > inner_temp)
+                    {
+                        inner_skip = 0;
+                        goto LZ3_restart_search;
+                    }
+                }
+                else
+                {
+                    inner_skip = max(inner_skip, skip);
                 }
                 uint32_t s = l - h;
                 bool assign = false;
