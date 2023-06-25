@@ -34,20 +34,12 @@ struct LZ3_match_info
     uint32_t position;
     uint32_t length;
     uint32_t offset;
+    uint32_t header;
+    uint32_t save;
 
-    LZ3_match_info(uint32_t position, uint32_t length, uint32_t offset) :
-        position(position), length(length), offset(offset)
+    LZ3_match_info(uint32_t position, uint32_t length, uint32_t offset, uint32_t header, uint32_t save) :
+        position(position), length(length), offset(offset), header(header), save(save)
     {
-    }
-
-    uint32_t header() const
-    {
-        return (offset % 8 == 0 && offset / 8 <= 0x7F) ? 2 : 3;
-    }
-
-    uint32_t save() const
-    {
-        return length - header();
     }
 };
 
@@ -178,16 +170,16 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 auto insert = matches.begin();
                 for (auto i = matches.rbegin(); i != matches.rend(); ++i)
                 {
-                    if (i->position == p && i->header() == h)
+                    if (i->position == p && i->header == h)
                     {
-                        if (i->save() < s)
+                        if (i->save < s)
                         {
-                            *i = { p, l, o };
+                            *i = { p, l, o, h, s };
                         }
                         assign = true;
                         break;
                     }
-                    if (i->position < p || (i->position == p && i->header() < h))
+                    if (i->position < p || (i->position == p && i->header < h))
                     {
                         insert = i.base();
                         break;
@@ -195,7 +187,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 }
                 if (!assign)
                 {
-                    matches.insert(insert, { p, l, o });
+                    matches.insert(insert, { p, l, o, h, s });
                 }
             }
         }
@@ -213,11 +205,11 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     vector<uint32_t> filter(srcSize);
     vector<LZ3_match_info> upper;
     vector<LZ3_match_info> lower;
-    stable_sort(matches.begin(), matches.end(), [](auto x, auto y) { return x.save() > y.save(); });
+    stable_sort(matches.begin(), matches.end(), [](auto x, auto y) { return x.save > y.save; });
     for (uint32_t i = 0; i < matches.size();)
     {
         const LZ3_match_info* match;
-        if (lower.size() > 0 && lower.back().save() >= matches[i].save())
+        if (lower.size() > 0 && lower.back().save >= matches[i].save)
         {
             match = &lower.back();
             lower.pop_back();
@@ -252,7 +244,8 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 break;
             }
         }
-        if (head + tail == 0)
+        uint32_t shrink = head + tail;
+        if (shrink == 0)
         {
             for (uint32_t j = 0; j < length; ++j)
             {
@@ -261,10 +254,10 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             upper.push_back(*match);
             continue;
         }
-        if (match->save() > head + tail)
+        if (match->save > shrink)
         {
-            LZ3_match_info m{ position + head, length - head - tail, match->offset };
-            auto iter = upper_bound(lower.begin(), lower.end(), m, [](auto x, auto y) { return x.save() < y.save(); });
+            LZ3_match_info m{ position + head, length - shrink, match->offset, match->header, match->save - shrink };
+            auto iter = upper_bound(lower.begin(), lower.end(), m, [](auto x, auto y) { return x.save < y.save; });
             lower.insert(iter, m);
         }
     }
