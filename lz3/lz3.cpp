@@ -11,6 +11,14 @@
 #include <fstream>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define LZ3_LIKELY(expr)   __builtin_expect((expr), 1)
+#define LZ3_UNLIKELY(expr) __builtin_expect((expr), 0)
+#else
+#define LZ3_LIKELY(expr)   (expr)
+#define LZ3_UNLIKELY(expr) (expr)
+#endif
+
 using namespace std;
 
 //3 byte variant of LZ4 for textures
@@ -72,7 +80,7 @@ void LZ3_write_VL16(uint8_t* dst, uint32_t& dstPos, uint32_t var)
 uint32_t LZ3_read_VL16(const uint8_t* src, uint32_t& srcPos)
 {
     uint32_t var = src[srcPos++];
-    if (var & 0x80)
+    if (LZ3_LIKELY(var & 0x80))
     {
         var ^= src[srcPos++] << 7;
     }
@@ -323,14 +331,14 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
         uint32_t literal = token >> 4;
         uint32_t length = (token & 0xF) + hash_length;
         uint32_t offset;
-        if (literal <= 14 && dstPos < dstShortEnd)
+        if (LZ3_LIKELY(literal <= 14 && dstPos < dstShortEnd))
         {
             assert(dstPos + 16 <= dstSize);
             memcpy(&dst[dstPos], &src[srcPos], 16);
             dstPos += literal;
             srcPos += literal;
             offset = LZ3_read_VL16(src, srcPos);
-            if (length <= 16 && offset >= 16)
+            if (LZ3_LIKELY(length <= 16 && offset >= 16))
             {
                 uint32_t refPos = dstPos - offset;
                 assert(dstPos + 16 <= dstSize);
