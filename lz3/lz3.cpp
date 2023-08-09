@@ -25,6 +25,7 @@ using namespace std;
 
 static constexpr uint32_t hash_length = 3;
 static constexpr uint32_t hash_bucket = 1 << 13;
+static constexpr uint32_t window_size = 1 << 15;
 
 struct LZ3_hash_node
 {
@@ -32,6 +33,21 @@ struct LZ3_hash_node
 
     LZ3_hash_node(uint32_t position) :
         position(position)
+    {
+    }
+};
+
+struct LZ3_hit_state
+{
+    uint32_t length;
+
+    LZ3_hit_state() :
+        length(0)
+    {
+    }
+
+    LZ3_hit_state(uint32_t length) :
+        length(length)
     {
     }
 };
@@ -95,8 +111,10 @@ static constexpr uint32_t wild_cmp_length = 8;
 uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
     vector<vector<LZ3_hash_node>> bytes_hash(hash_bucket);
-    uint32_t outer_skip = 0;
-    uint32_t inner_skip = 0;
+    vector<LZ3_hit_state> hit_prev(window_size);
+    vector<LZ3_hit_state> hit_curr(window_size);
+    vector<uint32_t> off_prev;
+    vector<uint32_t> off_curr;
     vector<LZ3_match_info> matches;
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     ofstream fs("LZ3_compress.log");
@@ -105,102 +123,69 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     for (; srcPos + hash_length - 1 < srcSize; srcPos++)
     {
         uint32_t hash = LZ3_FNV_hash<hash_length>(&src[srcPos]);
-        uint32_t slot = hash % hash_bucket;
-        vector<LZ3_hash_node>& found = bytes_hash[slot];
-        if (srcPos > outer_skip && found.size() > 0)
+        vector<LZ3_hash_node>& slot = bytes_hash[hash % hash_bucket];
+        for (auto iter = slot.rbegin(); iter != slot.rend(); ++iter)
         {
-        LZ3_restart_search:
-            uint32_t inner_temp = inner_skip;
-            for (auto iter = found.rbegin(); iter != found.rend(); ++iter)
+            uint32_t refPos = iter->position;
+            uint32_t o = srcPos - refPos;
+            if (o >= window_size)
             {
-                uint32_t curPos = iter->position;
-                uint32_t o = srcPos - curPos;
-                if (o > 0x7FFF)
-                {
-                    break;
-                }
-                uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
-                if (h != 2 && srcPos <= inner_temp)
-                {
-                    continue;
-                }
-                uint32_t f = 0; //bytes matched forward
-                {
-                    //match forward
-                    uint32_t srcShortEnd = srcSize - wild_cmp_length + 1;
-                    while (srcPos + f < srcShortEnd && memcmp(&src[srcPos + f], &src[curPos + f], wild_cmp_length) == 0)
-                    {
-                        f += wild_cmp_length;
-                    }
-                    uint32_t srcExactEnd = srcSize;
-                    while (srcPos + f < srcExactEnd && src[srcPos + f] == src[curPos + f])
-                    {
-                        f++;
-                    }
-                }
-                uint32_t b = 0; //bytes matched backward
-                {
-                    //match backward
-                    b += wild_cmp_length;
-                    while (curPos >= b && memcmp(&src[srcPos - b], &src[curPos - b], wild_cmp_length) == 0)
-                    {
-                        b += wild_cmp_length;
-                    }
-                    b -= wild_cmp_length;
-                    b += 1;
-                    while (curPos >= b && src[srcPos - b] == src[curPos - b])
-                    {
-                        b++;
-                    }
-                    b -= 1;
-                }
-                uint32_t p = srcPos - b;
-                uint32_t l = b + f;
-                if (l <= h)
-                {
-                    continue;
-                }
-                uint32_t skip = (p + l) - hash_length;
-                if (h == 2)
-                {
-                    outer_skip = max(outer_skip, skip);
-                    if (inner_temp != 0 && outer_skip > inner_temp)
-                    {
-                        inner_skip = 0;
-                        goto LZ3_restart_search;
-                    }
-                }
-                else
-                {
-                    inner_skip = max(inner_skip, skip);
-                }
-                uint32_t s = l - h;
-                bool assign = false;
-                auto insert = matches.begin();
-                for (auto i = matches.rbegin(); i != matches.rend(); ++i)
-                {
-                    if (i->position == p && i->header == h)
-                    {
-                        if (i->save < s)
-                        {
-                            *i = { p, l, o, h, s };
-                        }
-                        assign = true;
-                        break;
-                    }
-                    if (i->position < p || (i->position == p && i->header < h))
-                    {
-                        insert = i.base();
-                        break;
-                    }
-                }
-                if (!assign)
-                {
-                    matches.insert(insert, { p, l, o, h, s });
-                }
+                break;
             }
+            LZ3_hit_state& prev = hit_prev[o];
+            hit_curr[o] = {prev.length + 1};
+            prev.length = 0;
+            off_curr.push_back(o);
         }
-        found.emplace_back(srcPos);
+        uint32_t off_longest[4] = { 0 };
+        uint32_t len_longest[4] = { 0 };
+        for (uint32_t o : off_prev)
+        {
+            LZ3_hit_state &prev = hit_prev[o];
+            if (prev.length == 0)
+            {
+                continue;
+            }
+            uint32_t l = prev.length + hash_length - 1;
+            uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
+            if (l <= h)
+            {
+                continue;
+            }
+            if (l <= len_longest[h])
+            {
+                continue;
+            }
+            uint32_t prePos = srcPos - prev.length;
+            uint32_t refPos = prePos - o;
+            if (memcmp(&src[prePos], &src[refPos], l) != 0)
+            {
+                continue;
+            }
+            off_longest[h] = o;
+            len_longest[h] = l;
+        }
+        for (uint32_t o : off_longest)
+        {
+            if (o == 0)
+            {
+                continue;
+            }
+            LZ3_hit_state& prev = hit_prev[o];
+            uint32_t l = prev.length + hash_length - 1;
+            uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
+            uint32_t prePos = srcPos - prev.length;
+            matches.emplace_back(prePos, l, o, h, l - h);
+        }
+        for (uint32_t o : off_prev)
+        {
+            LZ3_hit_state& prev = hit_prev[o];
+            prev = { 0 };
+        }
+        off_prev.clear();
+        swap(hit_prev, hit_curr);
+        swap(off_prev, off_curr);
+        slot.emplace_back(srcPos);
     }
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     for (const LZ3_match_info& match : matches)
