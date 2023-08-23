@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
+#include <array>
 #include <vector>
 
 #define LZ3_LIBRARY
@@ -39,15 +40,32 @@ struct LZ3_hash_node
 
 struct LZ3_hit_state
 {
+    uint32_t position;
     uint32_t length;
 
     LZ3_hit_state() :
-        length(0)
+        position(0), length(0)
     {
     }
 
-    LZ3_hit_state(uint32_t length) :
-        length(length)
+    LZ3_hit_state(uint32_t position, uint32_t length) :
+        position(position), length(length)
+    {
+    }
+};
+
+struct LZ3_candi_info
+{
+    uint32_t length;
+    uint32_t offset;
+
+    LZ3_candi_info() :
+        length(0), offset(0)
+    {
+    }
+
+    LZ3_candi_info(uint32_t length, uint32_t offset) :
+        length(length), offset(offset)
     {
     }
 };
@@ -111,10 +129,10 @@ static constexpr uint32_t wild_cmp_length = 8;
 uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
     vector<vector<LZ3_hash_node>> bytes_hash(hash_bucket);
-    vector<LZ3_hit_state> hit_prev(window_size);
-    vector<LZ3_hit_state> hit_curr(window_size);
-    vector<uint32_t> off_prev;
-    vector<uint32_t> off_curr;
+    vector<LZ3_hit_state> state_prev(window_size);
+    vector<LZ3_hit_state> state_curr(window_size);
+    array<LZ3_candi_info, 4> candi_prev;
+    array<LZ3_candi_info, 4> candi_curr;
     vector<LZ3_match_info> matches;
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     ofstream fs("LZ3_compress.log");
@@ -126,65 +144,60 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         vector<LZ3_hash_node>& slot = bytes_hash[hash % hash_bucket];
         for (auto iter = slot.rbegin(); iter != slot.rend(); ++iter)
         {
-            uint32_t refPos = iter->position;
-            uint32_t o = srcPos - refPos;
+            uint32_t o = srcPos - iter->position;
             if (o >= window_size)
             {
                 break;
             }
-            LZ3_hit_state& prev = hit_prev[o];
-            hit_curr[o] = {prev.length + 1};
-            prev.length = 0;
-            off_curr.push_back(o);
-        }
-        uint32_t off_longest[4] = { 0 };
-        uint32_t len_longest[4] = { 0 };
-        for (uint32_t o : off_prev)
-        {
-            LZ3_hit_state &prev = hit_prev[o];
-            if (prev.length == 0)
+            LZ3_hit_state& prev = state_prev[o];
+            LZ3_hit_state& curr = state_curr[o];
+            curr.position = srcPos;
+            if (prev.position == srcPos - 1)
+            {
+                curr.length = prev.length + 1;
+            }
+            else
+            {
+                curr.length = 1;
+            }
+            uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
+            if (candi_curr[h].length >= curr.length)
             {
                 continue;
             }
-            uint32_t l = prev.length + hash_length - 1;
-            uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
+            if (candi_prev[h].offset == o)
+            {
+                candi_prev[h].length = 0;
+                candi_prev[h].offset = 0;
+            }
+            uint32_t l = curr.length + hash_length - 1;
             if (l <= h)
             {
                 continue;
             }
-            if (l <= len_longest[h])
+            uint32_t curPos = srcPos - curr.length + 1;
+            uint32_t refPos = curPos - o;
+            if (memcmp(&src[curPos], &src[refPos], l) == 0)
             {
-                continue;
+                candi_curr[h].length = curr.length;
+                candi_curr[h].offset = o;
             }
-            uint32_t prePos = srcPos - prev.length;
-            uint32_t refPos = prePos - o;
-            if (memcmp(&src[prePos], &src[refPos], l) != 0)
-            {
-                continue;
-            }
-            off_longest[h] = o;
-            len_longest[h] = l;
         }
-        for (uint32_t o : off_longest)
+        for (uint32_t h = 0; h < candi_prev.size(); ++h)
         {
+            uint32_t o = candi_prev[h].offset;
             if (o == 0)
             {
                 continue;
             }
-            LZ3_hit_state& prev = hit_prev[o];
+            LZ3_hit_state& prev = state_prev[o];
             uint32_t l = prev.length + hash_length - 1;
-            uint32_t h = (o % 8 == 0 && o / 8 <= 0x7F) ? 2 : 3;
             uint32_t prePos = srcPos - prev.length;
             matches.emplace_back(prePos, l, o, h, l - h);
         }
-        for (uint32_t o : off_prev)
-        {
-            LZ3_hit_state& prev = hit_prev[o];
-            prev = { 0 };
-        }
-        off_prev.clear();
-        swap(hit_prev, hit_curr);
-        swap(off_prev, off_curr);
+        swap(state_prev, state_curr);
+        swap(candi_prev, candi_curr);
+        fill(candi_curr.begin(), candi_curr.end(), LZ3_candi_info());
         slot.emplace_back(srcPos);
     }
 #if defined(LZ3_LOG) && !defined(NDEBUG)
