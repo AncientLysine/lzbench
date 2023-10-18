@@ -327,10 +327,11 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     }
     uint16_t stained[0x8000] = { 0 };
     map<uint32_t, uint32_t> offsets;
+    //大于4byte的match，必定采纳
     while (!candidates.empty())
     {
         LZ3_match_info match = candidates.top();
-        if (match.length < min_match_length)
+        if (match.length <= min_match_length)
         {
             break;
         }
@@ -378,6 +379,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             candidates.push(match);
         }
     }
+    //等于3byte的match，采纳其中offset符合的
     while (!offsets.empty())
     {
         auto rare = min_element(offsets.begin(), offsets.end(), [](auto x, auto y) { return x.second < y.second; });
@@ -387,26 +389,33 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         {
             break;
         }
-        for (LZ3_match_info& match : matches)
+        for (auto match = matches.begin(); match != matches.end();)
         {
-            if (match.offset == offset)
+            if (match->offset == offset)
             {
-                LZ3_match_info m = match;
-                while (m.match_next(psa, srcSize))
+                LZ3_match_info next = *match;
+                auto offset = offsets.end();
+                while (next.match_next(psa, srcSize))
                 {
-                    if (m.length < match.length)
+                    if (next.length < match->length)
                     {
                         break;
                     }
-                    auto iter = offsets.find(m.offset);
-                    if (iter != offsets.end())
+                    offset = offsets.find(next.offset);
+                    if (offset != offsets.end())
                     {
-                        match = m;
-                        offsets[match.offset]++;
+                        *match = next;
+                        offset->second++;
                         break;
                     }
                 }
+                if (offset == offsets.end() && match->length <= min_match_length)
+                {
+                    match = matches.erase(match);
+                    continue;
+                }
             }
+            ++match;
         }
         offsets.erase(rare);
     }
