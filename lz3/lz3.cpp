@@ -32,10 +32,12 @@ using namespace std;
 * | offset mode | offset value | match length | literal length |
 */
 
+static constexpr uint32_t max_block_size = 0x8000;
+
 class LZ3_suffix_array
 {
 public:
-    static const uint32_t N = 0x8000;
+    uint32_t n;
 
     uint32_t* sa;
     uint32_t* rk;
@@ -44,14 +46,15 @@ public:
     //sa是我们要求的后缀数组
     //rk数组保存的值相当于是rank值。下面的操作只是用rk数组来比较字符的大小，所以没有必要求出当前真实的rank值。所以这里rk保存位置i的字符就好
     //最后返回的rk才是rank值，rk[i]=后缀i的名次
-    void cal_suffix_array(const uint8_t* s, uint32_t n) {
+    void cal_suffix_array(const uint8_t* s, uint32_t l) {
         uint32_t bucket_count = 256;
 
+        n = l;
         sa = &buffer[0];
-        rk = &buffer[N];
-        uint32_t* sa_2nd = &buffer[N * 2];
-        uint32_t* rk_2nd = &buffer[N * 3];
-        uint32_t* bucket = &buffer[N * 4];
+        rk = &buffer[max_block_size];
+        uint32_t* sa_2nd = &buffer[max_block_size * 2];
+        uint32_t* rk_2nd = &buffer[max_block_size * 3];
+        uint32_t* bucket = &buffer[max_block_size * 4];
 
         //对第一个字符排序
         fill(bucket, bucket + bucket_count, 0);
@@ -101,8 +104,9 @@ public:
 
     uint32_t* height;
 
-    void cal_height(const uint8_t* s, uint32_t n) {
-        height = &buffer[N * 4];
+    void cal_height(const uint8_t* s, uint32_t l) {
+        assert(n == l);
+        height = &buffer[max_block_size * 4];
 
         uint32_t k = 0;
         for (int i = 0; i < n; ++i) {
@@ -121,7 +125,7 @@ public:
     }
 
 private:
-    uint32_t buffer[N * 5];
+    uint32_t buffer[max_block_size * 5];
 
     bool rank_both_equal(uint32_t* r, uint32_t a, uint32_t b, uint32_t l, uint32_t n) {
         if (r[a] != r[b]) return false;
@@ -142,13 +146,13 @@ public:
     uint32_t offset;
 
     LZ3_match_info(const LZ3_suffix_array* psa, uint32_t position) :
-        position(position), length(0x8000), offset(0)
+        position(position), length(max_block_size), offset(0)
     {
         prev = psa->rk[position];
         next = psa->rk[position] + 1;
     }
 
-    bool match_next(const LZ3_suffix_array* psa, uint32_t n)
+    bool match_next(const LZ3_suffix_array* psa)
     {
         while (true)
         {
@@ -158,7 +162,7 @@ public:
                 length = min(length, psa->height[prev]);
                 index = psa->sa[--prev];
             }
-            else if (next < n)
+            else if (next < psa->n)
             {
                 length = min(length, psa->height[next]);
                 index = psa->sa[next++];
@@ -186,7 +190,7 @@ public:
 
     static bool compare_length(const LZ3_match_info& x, const LZ3_match_info& y)
     {
-        return x.length < y.length;
+        return x.length != y.length ? x.length < y.length : x.position < y.position;
     }
 
 private:
@@ -315,71 +319,65 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     }
     ofstream cfs("LZ3_compress.log");
 #endif
-    vector<LZ3_match_info> matches;
     priority_queue<LZ3_match_info, vector<LZ3_match_info>, decltype(&LZ3_match_info::compare_length)> candidates(&LZ3_match_info::compare_length);
     for (uint32_t i = 1; i < srcSize; ++i)
     {
         LZ3_match_info match(psa, i);
-        if (match.match_next(psa, srcSize))
+        if (match.match_next(psa))
         {
             candidates.push(match);
         }
     }
-    uint16_t stained[0x8000] = { 0 };
+    uint16_t stained[max_block_size] = { 0 };
+    vector<LZ3_match_info> matches;
+    vector<LZ3_match_info> recycle;
     map<uint32_t, uint32_t> offsets;
-    //大于4byte的match，必定采纳
     while (!candidates.empty())
     {
         LZ3_match_info match = candidates.top();
-        if (match.length <= min_match_length)
+        uint32_t length = match.length;
+        if (length < min_match_length)
         {
             break;
         }
         candidates.pop();
-        uint32_t head = 0, tail = 0;
-        for (uint32_t j = 0; j < match.length; j++)
-        {
-            if (stained[match.position + j] != 0)
-            {
-                head++;
-            }
-            else
-            {
-                break;
-            }
-        }
-        if (head > 0)
+        uint32_t position = match.position;
+        if (stained[position] != 0)
         {
             continue;
         }
-        for (uint32_t j = 0; j < match.length; j++)
+        if (stained[position + length - 1] != 0)
         {
-            if (stained[match.position + match.length - 1 - j] != 0)
+            length--;
+            while (stained[position + length - 1] != 0)
             {
-                tail++;
+                length--;
             }
-            else
+            if (length >= min_match_length)
             {
-                break;
+                match.length = length;
+                candidates.push(match);
             }
+            continue;
         }
-        if (tail == 0)
+        if (length > min_match_length)
         {
+            //match longer than 3 bytes, sure to survive
             matches.push_back(match);
             offsets[match.offset]++;
             uint16_t stain = (uint16_t)matches.size();
-            for (uint32_t j = 0; j < match.length; ++j)
+            for (uint32_t j = 0; j < length; ++j)
             {
-                stained[match.position + j] = stain;
+                stained[position + j] = stain;
             }
         }
-        else if (match.length - tail >= min_match_length)
+        else
         {
-            match.length -= tail;
-            candidates.push(match);
+            //match exactly 3 bytes, needs a frequent offset to survive
+            recycle.push_back(match);
+            offsets[match.offset]++;
         }
     }
-    //等于3byte的match，采纳其中offset符合的
     while (!offsets.empty())
     {
         auto rare = min_element(offsets.begin(), offsets.end(), [](auto x, auto y) { return x.second < y.second; });
@@ -393,25 +391,53 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         {
             if (match->offset == offset)
             {
-                LZ3_match_info next = *match;
-                auto offset = offsets.end();
-                while (next.match_next(psa, srcSize))
+                LZ3_match_info m = *match;
+                auto o = offsets.end();
+                while (m.match_next(psa))
                 {
-                    if (next.length < match->length)
+                    if (m.length < match->length)
                     {
                         break;
                     }
-                    offset = offsets.find(next.offset);
-                    if (offset != offsets.end())
+                    o = offsets.find(m.offset);
+                    if (o != offsets.end())
                     {
-                        *match = next;
-                        offset->second++;
+                        *match = m;
+                        o->second++;
                         break;
                     }
                 }
-                if (offset == offsets.end() && match->length <= min_match_length)
+                if (o == offsets.end() && match->length <= min_match_length)
                 {
                     match = matches.erase(match);
+                    continue;
+                }
+            }
+            ++match;
+        }
+        for (auto match = recycle.begin(); match != recycle.end();)
+        {
+            if (match->offset == offset)
+            {
+                LZ3_match_info m = *match;
+                auto o = offsets.end();
+                while (m.match_next(psa))
+                {
+                    if (m.length < match->length)
+                    {
+                        break;
+                    }
+                    o = offsets.find(m.offset);
+                    if (o != offsets.end())
+                    {
+                        *match = m;
+                        o->second++;
+                        break;
+                    }
+                }
+                if (o == offsets.end() && match->length <= min_match_length)
+                {
+                    match = recycle.erase(match);
                     continue;
                 }
             }
@@ -420,6 +446,23 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         offsets.erase(rare);
     }
     delete psa;
+    for (const LZ3_match_info& match : recycle)
+    {
+        uint32_t position = match.position;
+        uint32_t length = match.length;
+        if (stained[position] != 0 || stained[position + length - 1] != 0)
+        {
+            continue;
+        }
+        {
+            matches.push_back(match);
+            uint16_t stain = (uint16_t)matches.size();
+            for (uint32_t j = 0; j < length; ++j)
+            {
+                stained[position + j] = stain;
+            }
+        }
+    }
     stable_sort(matches.begin(), matches.end(), &LZ3_match_info::compare_position);
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     for (const LZ3_match_info& match : matches)
