@@ -2,9 +2,7 @@
 #include <cassert>
 #include <cstring>
 #include <memory>
-#include <array>
 #include <map>
-#include <queue>
 #include <vector>
 
 #define LZ3_LIBRARY
@@ -183,16 +181,6 @@ public:
         }
     }
 
-    static bool compare_position(const LZ3_match_info& x, const LZ3_match_info& y)
-    {
-        return x.position < y.position;
-    }
-
-    static bool compare_length(const LZ3_match_info& x, const LZ3_match_info& y)
-    {
-        return x.length != y.length ? x.length < y.length : x.position < y.position;
-    }
-
 private:
     uint32_t prev;    //向前遍历到的后缀排名
     uint32_t next;    //向后遍历到的后缀排名
@@ -319,28 +307,49 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     }
     ofstream cfs("LZ3_compress.log");
 #endif
-    priority_queue<LZ3_match_info, vector<LZ3_match_info>, decltype(&LZ3_match_info::compare_length)> candidates(&LZ3_match_info::compare_length);
+    vector<LZ3_match_info> candidates;
     for (uint32_t i = 1; i < srcSize; ++i)
     {
         LZ3_match_info match(psa, i);
         if (match.match_next(psa))
         {
-            candidates.push(match);
+            candidates.push_back(match);
         }
     }
-    uint16_t stained[max_block_size] = { 0 };
-    vector<LZ3_match_info> matches;
-    vector<LZ3_match_info> recycle;
-    map<uint32_t, uint32_t> offsets;
-    while (!candidates.empty())
+    uint32_t maxLength = 0;
+    for (const LZ3_match_info& match : candidates)
     {
-        LZ3_match_info match = candidates.top();
+        maxLength = max(maxLength, match.length);
+    }
+    vector<uint32_t> countByLength(maxLength + 1, 0);
+    for (const LZ3_match_info& match : candidates)
+    {
+        countByLength[match.length]++;
+    }
+    for (size_t i = maxLength; i > 0 ; --i)
+    {
+        countByLength[i - 1] += countByLength[i];
+    }
+    vector<uint32_t> orderByLength(candidates.size());
+    for (auto match = candidates.cend(); match != candidates.cbegin(); )
+    {
+        --match;
+        uint32_t length = match->length;
+        uint32_t index = distance(candidates.cbegin(), match);
+        orderByLength[--countByLength[length]] = index;
+    }
+    uint16_t stained[max_block_size] = { 0 };
+    vector<uint32_t> matches;
+    map<uint32_t, uint32_t> offsets;
+    for (auto i = orderByLength.begin(); i != orderByLength.end(); ++i)
+    {
+        uint32_t index = *i;
+        LZ3_match_info& match = candidates[index];
         uint32_t length = match.length;
         if (length < min_match_length)
         {
             break;
         }
-        candidates.pop();
         uint32_t position = match.position;
         if (stained[position] != 0)
         {
@@ -349,121 +358,145 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         if (stained[position + length - 1] != 0)
         {
             length--;
-            while (stained[position + length - 1] != 0)
+            while (length >= min_match_length && stained[position + length - 1] != 0)
             {
                 length--;
             }
             if (length >= min_match_length)
             {
+                auto moveBegin = i + 1;
+                auto moveEnd = moveBegin;
+                for (; moveEnd != orderByLength.end(); ++moveEnd)
+                {
+                    if (candidates[*moveEnd].length != match.length)
+                    {
+                        break;
+                    }
+                }
+                if (length <= match.length - 1)
+                {
+                    moveEnd += countByLength[length] - countByLength[match.length - 1];
+                }
+                for (; moveEnd != orderByLength.end(); ++moveEnd)
+                {
+                    if (candidates[*moveEnd].position > position)
+                    {
+                        break;
+                    }
+                }
+                auto moveNext = move(moveBegin, moveEnd, i);
+                *moveNext = index;
+                for (uint32_t l = match.length; l > length; --l)
+                {
+                    countByLength[l]--;
+                }
                 match.length = length;
-                candidates.push(match);
+                --i;
             }
             continue;
         }
+        matches.push_back(index);
+        offsets[match.offset]++;
         if (length > min_match_length)
         {
             //match longer than 3 bytes, sure to survive
-            matches.push_back(match);
-            offsets[match.offset]++;
             uint16_t stain = (uint16_t)matches.size();
             for (uint32_t j = 0; j < length; ++j)
             {
                 stained[position + j] = stain;
             }
+        }
+    }
+    multimap<uint32_t, uint32_t> orderByOffset;
+    for (uint32_t index : matches)
+    {
+        const LZ3_match_info& match = candidates[index];
+        orderByOffset.emplace(match.offset, index);
+    }
+    multimap<uint32_t, uint32_t> orderByOccur;
+    for (const auto& i : offsets)
+    {
+        orderByOccur.emplace(i.second, i.first);
+    }
+    for (auto i = orderByOccur.begin(); i != orderByOccur.end();)
+    {
+        uint32_t offset = i->second;
+        uint32_t occur = offsets[offset];
+        if (occur > i->first)
+        {
+            orderByOccur.emplace(occur, offset);
+            i = orderByOccur.erase(i);
         }
         else
         {
-            //match exactly 3 bytes, needs a frequent offset to survive
-            recycle.push_back(match);
-            offsets[match.offset]++;
-        }
-    }
-    while (!offsets.empty())
-    {
-        auto rare = min_element(offsets.begin(), offsets.end(), [](auto x, auto y) { return x.second < y.second; });
-        uint32_t offset = rare->first;
-        uint32_t count = rare->second;
-        if (offsets.size() <= 128 && count > sizeof(uint16_t)/*sizeof mode1 offset desc*/)
-        {
-            break;
-        }
-        for (auto match = matches.begin(); match != matches.end();)
-        {
-            if (match->offset == offset)
+            if (offsets.size() <= 128 && occur > sizeof(uint16_t)/*sizeof mode1 offset desc*/)
             {
-                LZ3_match_info m = *match;
+                break;
+            }
+            auto range = orderByOffset.equal_range(offset);
+            for (auto j = range.first; j != range.second; ++j)
+            {
+                uint32_t index = j->second;
+                LZ3_match_info& match = candidates[index];
                 auto o = offsets.end();
+                LZ3_match_info m = match;
                 while (m.match_next(psa))
                 {
-                    if (m.length < match->length)
+                    if (m.length < match.length)
                     {
                         break;
                     }
                     o = offsets.find(m.offset);
                     if (o != offsets.end())
                     {
-                        *match = m;
+                        match = m;
                         o->second++;
+                        orderByOffset.emplace(m.offset, index);
                         break;
                     }
                 }
-                if (o == offsets.end() && match->length <= min_match_length)
-                {
-                    match = matches.erase(match);
-                    continue;
-                }
             }
-            ++match;
-        }
-        for (auto match = recycle.begin(); match != recycle.end();)
-        {
-            if (match->offset == offset)
+            offsets.erase(offset);
+            orderByOffset.erase(range.first, range.second);
+            if (offsets.empty())
             {
-                LZ3_match_info m = *match;
-                auto o = offsets.end();
-                while (m.match_next(psa))
-                {
-                    if (m.length < match->length)
-                    {
-                        break;
-                    }
-                    o = offsets.find(m.offset);
-                    if (o != offsets.end())
-                    {
-                        *match = m;
-                        o->second++;
-                        break;
-                    }
-                }
-                if (o == offsets.end() && match->length <= min_match_length)
-                {
-                    match = recycle.erase(match);
-                    continue;
-                }
+                break;
             }
-            ++match;
+            ++i;
         }
-        offsets.erase(rare);
     }
     delete psa;
-    for (const LZ3_match_info& match : recycle)
+    for (auto i = matches.begin(); i != matches.end();)
     {
-        uint32_t position = match.position;
+        const LZ3_match_info& match = candidates[*i];
         uint32_t length = match.length;
-        if (stained[position] != 0 || stained[position + length - 1] != 0)
+        if (length > min_match_length)
         {
+            ++i;
             continue;
         }
+        uint32_t position = match.position;
+        if (stained[position] != 0 || stained[position + length - 1] != 0)
         {
-            matches.push_back(match);
+            i = matches.erase(i);
+            continue;
+        }
+        if (offsets.find(match.offset) != offsets.end())
+        {
+            //match exactly 3 bytes, needs a frequent offset to survive
             uint16_t stain = (uint16_t)matches.size();
             for (uint32_t j = 0; j < length; ++j)
             {
                 stained[position + j] = stain;
             }
+            ++i;
+        }
+        else
+        {
+            i = matches.erase(i);
         }
     }
-    stable_sort(matches.begin(), matches.end(), &LZ3_match_info::compare_position);
+    stable_sort(matches.begin(), matches.end());
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     for (const LZ3_match_info& match : matches)
     {
@@ -477,8 +510,9 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     uint32_t dictSize = 0;
     uint32_t srcPos = 0;
     uint32_t dstPos = 0;
-    for (const LZ3_match_info& match : matches)
+    for (uint32_t i : matches)
     {
+        const LZ3_match_info& match = candidates[i];
         uint32_t position = match.position;
         if (position < srcPos)
         {
