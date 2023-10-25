@@ -170,7 +170,8 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                 uint32_t f = 0; //bytes matched forward
                 {
                     //match forward
-                    uint32_t srcShortEnd = srcSize - wild_cmp_length + 1;
+                    constexpr uint32_t srcShortLength = wild_cmp_length - 1;
+                    uint32_t srcShortEnd = srcSize > srcShortLength ? srcSize - srcShortLength : 0;
                     while (srcPos + f < srcShortEnd && memcmp(&src[srcPos + f], &src[curPos + f], wild_cmp_length) == 0)
                     {
                         f += wild_cmp_length;
@@ -366,7 +367,10 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
 #endif
     uint32_t srcPos = 0;
     uint32_t dstPos = 0;
-    uint32_t dstShortEnd = dstSize - min(wild_cpy_length, 14u) - min(wild_cpy_length, 14u + hash_length);
+    constexpr uint32_t literalShortLen = min(wild_cpy_length, 14u);
+    constexpr uint32_t matchShortLen = min(wild_cpy_length, 14u + hash_length);
+    constexpr uint32_t dstShortLen = literalShortLen + matchShortLen;
+    uint32_t dstShortEnd = dstSize > dstShortLen ? dstSize - dstShortLen : 0;
     while (true)
     {
         uint16_t token;
@@ -375,13 +379,13 @@ uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
         uint32_t literal = token & 0xF;
         uint32_t length = (token >> 4) & 0xF;
         uint32_t offset;
-        if (LZ3_LIKELY(literal <= min(wild_cpy_length, 14u) && dstPos < dstShortEnd))
+        if (LZ3_LIKELY(literal <= literalShortLen && dstPos < dstShortEnd))
         {
             memcpy(&dst[dstPos], &src[srcPos], wild_cpy_length);
             dstPos += literal;
             srcPos += literal;
             offset = LZ3_read_VL78(src, srcPos, token);
-            if (LZ3_LIKELY(length + hash_length <= min(wild_cpy_length, 14u + hash_length) && offset >= wild_cpy_length))
+            if (LZ3_LIKELY(length + hash_length <= matchShortLen && offset >= wild_cpy_length))
             {
                 length = length + hash_length;
                 assert(dstPos >= offset);
