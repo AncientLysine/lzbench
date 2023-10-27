@@ -3,6 +3,7 @@
 #include <cstring>
 #include <memory>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 #define LZ3_LIBRARY
@@ -186,6 +187,134 @@ private:
     uint32_t next;    //向后遍历到的后缀排名
 };
 
+template<typename T, typename Size = size_t, Size min_cap = 16>
+class LZ3_vector
+{
+public:
+    typedef T value_type;
+    typedef Size size_type;
+    typedef T* iterator;
+    typedef const T* const_iterator;
+
+    LZ3_vector():
+        _data(_local), _size(0u)
+    {
+    }
+
+    LZ3_vector(LZ3_vector&& other)
+    {
+        if (other._size > min_cap)
+        {
+            _data = other._data;
+            _size = other._size;
+            other._data = nullptr;
+        }
+        else
+        {
+            _size = other._size;
+            copy(other.begin(), other.end(), begin());
+        }
+    }
+
+    ~LZ3_vector()
+    {
+        if (_size > min_cap)
+        {
+            delete[] _data;
+        }
+    }
+
+    iterator begin()
+    {
+        return _data;
+    }
+
+    iterator end()
+    {
+        return _data + _size;
+    }
+
+    const_iterator begin() const
+    {
+        return _data;
+    }
+
+    const_iterator end() const
+    {
+        return _data + _size;
+    }
+
+    size_type size() const
+    {
+        return _size;
+    }
+
+    size_type capacity() const
+    {
+        if (_size > min_cap)
+        {
+            return _cap;
+        }
+        else
+        {
+            return min_cap;
+        }
+    }
+
+    iterator insert(iterator pos, const T& value)
+    {
+        size_t index = pos - begin();
+        ensure_cap();
+        pos = begin() + index;
+        copy(pos, end(), pos + 1);
+        *pos = value;
+        ++_size;
+        return pos;
+    }
+
+    void push_back(const T& value)
+    {
+        ensure_cap();
+        *end() = value;
+        ++_size;
+    }
+
+private:
+    value_type* _data;
+    size_type _size;
+    union
+    {
+        value_type _local[min_cap];
+        size_type _cap;
+    };
+
+    void ensure_cap()
+    {
+        if (_size > min_cap)
+        {
+            if (_size == _cap)
+            {
+                Size newCap = _cap * 2;
+                T* newData = new T[newCap];
+                copy(_data, _data + _size, newData);
+                delete[] _data;
+                _data = newData;
+                _cap = newCap;
+            }
+        }
+        else
+        {
+            if (_size == min_cap)
+            {
+                Size newCap = min_cap * 2;
+                _data = new T[newCap];
+                copy(_local, _local + _size, _data);
+                _cap = newCap;
+            }
+        }
+    }
+};
+
 inline void LZ3_write_VL48(uint8_t* dst, uint32_t& dstPos, uint32_t value)
 {
     if (value >= 0xF)
@@ -335,12 +464,11 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     {
         --match;
         uint32_t length = match->length;
-        uint32_t index = distance(candidates.cbegin(), match);
+        uint32_t index = (uint32_t)distance(candidates.cbegin(), match);
         orderByLength[--countByLength[length]] = index;
     }
     uint16_t stained[max_block_size] = { 0 };
     vector<uint32_t> matches;
-    map<uint32_t, uint32_t> offsets;
     for (auto i = orderByLength.begin(); i != orderByLength.end(); ++i)
     {
         uint32_t index = *i;
@@ -364,31 +492,15 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             }
             if (length >= min_match_length)
             {
+                auto findBegin = orderByLength.begin() + countByLength[length];
+                auto findEnd = orderByLength.begin() + countByLength[length - 1];
                 auto moveBegin = i + 1;
-                auto moveEnd = moveBegin;
-                for (; moveEnd != orderByLength.end(); ++moveEnd)
-                {
-                    if (candidates[*moveEnd].length != match.length)
-                    {
-                        break;
-                    }
-                }
-                if (length <= match.length - 1)
-                {
-                    moveEnd += countByLength[length] - countByLength[match.length - 1];
-                }
-                for (; moveEnd != orderByLength.end(); ++moveEnd)
-                {
-                    if (candidates[*moveEnd].position > position)
-                    {
-                        break;
-                    }
-                }
-                auto moveNext = move(moveBegin, moveEnd, i);
+                auto moveEnd = upper_bound(findBegin, findEnd, index);
+                auto moveNext = copy(moveBegin, moveEnd, i);
                 *moveNext = index;
                 for (uint32_t l = match.length; l > length; --l)
                 {
-                    countByLength[l]--;
+                    countByLength[l - 1]--;
                 }
                 match.length = length;
                 --i;
@@ -396,7 +508,6 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             continue;
         }
         matches.push_back(index);
-        offsets[match.offset]++;
         if (length > min_match_length)
         {
             //match longer than 3 bytes, sure to survive
@@ -407,36 +518,42 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
             }
         }
     }
-    multimap<uint32_t, uint32_t> orderByOffset;
+    unordered_map<uint32_t, LZ3_vector<uint16_t, uint16_t, 3>> offsets;
     for (uint32_t index : matches)
     {
         const LZ3_match_info& match = candidates[index];
-        orderByOffset.emplace(match.offset, index);
+        uint32_t offset = match.offset;
+        auto& vec = offsets[offset];
+        vec.push_back((uint16_t)index);
     }
-    multimap<uint32_t, uint32_t> orderByOccur;
+    map<uint32_t, LZ3_vector<uint16_t, uint16_t, 3>> orderByOccur;
     for (const auto& i : offsets)
     {
-        orderByOccur.emplace(i.second, i.first);
+        uint16_t offset = (uint16_t)i.first;
+        uint32_t occur = i.second.size();
+        auto& vec = orderByOccur[occur];
+        auto ins = upper_bound(vec.begin(), vec.end(), offset);
+        vec.insert(ins, offset);
     }
-    for (auto i = orderByOccur.begin(); i != orderByOccur.end();)
+    for (const auto& i : orderByOccur)
     {
-        uint32_t offset = i->second;
-        uint32_t occur = offsets[offset];
-        if (occur > i->first)
+        for (uint16_t offset : i.second)
         {
-            orderByOccur.emplace(occur, offset);
-            i = orderByOccur.erase(i);
-        }
-        else
-        {
+            auto j = offsets.find(offset);
+            uint32_t occur = j->second.size();
+            if (occur > i.first)
+            {
+                auto& vec = orderByOccur[occur];
+                auto ins = upper_bound(vec.begin(), vec.end(), offset); //does insert postion matters here?
+                vec.insert(ins, offset);
+                continue;
+            }
             if (offsets.size() <= 128 && occur > sizeof(uint16_t)/*sizeof mode1 offset desc*/)
             {
                 break;
             }
-            auto range = orderByOffset.equal_range(offset);
-            for (auto j = range.first; j != range.second; ++j)
+            for (uint32_t index : j->second)
             {
-                uint32_t index = j->second;
                 LZ3_match_info& match = candidates[index];
                 auto o = offsets.end();
                 LZ3_match_info m = match;
@@ -450,19 +567,16 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                     if (o != offsets.end())
                     {
                         match = m;
-                        o->second++;
-                        orderByOffset.emplace(m.offset, index);
+                        offsets[m.offset].push_back(index);
                         break;
                     }
                 }
             }
-            offsets.erase(offset);
-            orderByOffset.erase(range.first, range.second);
+            offsets.erase(j);
             if (offsets.empty())
             {
                 break;
             }
-            ++i;
         }
     }
     delete psa;
