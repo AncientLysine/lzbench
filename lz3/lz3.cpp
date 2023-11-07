@@ -59,31 +59,31 @@ public:
 
         //对第一个字符排序
         fill(bucket, bucket + bucket_count, 0);
-        for (int i = 0; i < n; ++i) ++bucket[rk[i] = s[i]];
-        for (int i = 1; i < bucket_count; ++i) bucket[i] += bucket[i - 1];
-        for (int i = n - 1; i >= 0; --i) sa[--bucket[rk[i]]] = i;
+        for (uint32_t i = 0; i < n; ++i) ++bucket[rk[i] = s[i]];
+        for (uint32_t i = 1; i < bucket_count; ++i) bucket[i] += bucket[i - 1];
+        for (int32_t i = n - 1; i >= 0; --i) sa[--bucket[rk[i]]] = i;
 
         //对长度为2^j的后缀排序
-        for (int j = 1; ; j *= 2) {
+        for (uint32_t j = 1;; j *= 2) {
             //接下来进行若干次基数排序，在实现的时候，这里有一个小优化。
             //基数排序要分两次，第一次是对第二关键字排序，第二次是对第一关键字排序。
             //对第二关键字排序的结果实际上可以利用上一次求得的sa直接算出，没有必要再算一次。
 
             //数组sa_2nd保存的是对第二关键字排序的结果,sa_2nd[p] = 排名为p的为哪个后缀的第二关键字
-            int p = 0;
-            for (int i = n - j; i < n; ++i) sa_2nd[p++] = i; //因为从n - j开始后面的第二部分都是空串，所以排在前面
-            for (int i = 0; i < n; ++i) if (sa[i] >= j) sa_2nd[p++] = sa[i] - j;
+            uint32_t p = 0;
+            for (uint32_t i = n - j; i < n; ++i) sa_2nd[p++] = i; // 因为从n - j开始后面的第二部分都是空串，所以排在前面
+            for (uint32_t i = 0; i < n; ++i) if (sa[i] >= j) sa_2nd[p++] = sa[i] - j;
 
             //按第二关键字排序后，第一关键字的原排名。用第一关键字分桶就得到了一二关键字的排序
 
             //rk_2nd[i] = rk[sa_2nd[i]]是第二关键字排名为i的后缀的第一关键字排名
-            for (int i = 0; i < n; ++i) rk_2nd[i] = rk[sa_2nd[i]]; //按第二关键字排序，将rk[sa_2nd[i]]结果存起来，减少寻址次数。
+            for (uint32_t i = 0; i < n; ++i) rk_2nd[i] = rk[sa_2nd[i]]; // 按第二关键字排序，将rk[sa_2nd[i]]结果存起来，减少寻址次数。
 
             //分桶，排序
             fill(bucket, bucket + bucket_count, 0);
-            for (int i = 0; i < n; ++i) ++bucket[rk_2nd[i]];
-            for (int i = 1; i < bucket_count; ++i) bucket[i] += bucket[i - 1];
-            for (int i = n - 1; i >= 0; --i) sa[--bucket[rk_2nd[i]]] = sa_2nd[i];
+            for (uint32_t i = 0; i < n; ++i) ++bucket[rk_2nd[i]];
+            for (uint32_t i = 1; i < bucket_count; ++i) bucket[i] += bucket[i - 1];
+            for (int32_t i = n - 1; i >= 0; --i) sa[--bucket[rk_2nd[i]]] = sa_2nd[i];
 
             //求解新的rank数组
 
@@ -91,7 +91,7 @@ public:
             swap(rk, rk_2nd);
             p = 0;
             rk[sa[0]] = p++;
-            for (int i = 1; i < n; ++i) {
+            for (uint32_t i = 1; i < n; ++i) {
                 //因为这里的sa数组对于后缀相同时，排名按位置前后排，所以这里rank还需要判重
                 //对于两个后缀sa[i - 1]和sa[i]，他们第一关键字和第二关键字是否都一样，这个可以通过判断本来的rank在对应位置是否相同
                 rk[sa[i]] = rank_both_equal(rk_2nd, sa[i - 1], sa[i], j, n) ? p - 1 : p++;
@@ -106,11 +106,11 @@ public:
     uint32_t* height;
 
     void cal_height(const uint8_t* s, uint32_t l) {
-        assert(n == l);
+        assert(l == n);
         height = &buffer[max_block_size * 4];
 
         uint32_t k = 0;
-        for (int i = 0; i < n; ++i) {
+        for (uint32_t i = 0; i < l; ++i) {
             uint32_t r = rk[i];
             if (r == 0) {
                 height[r] = 0;
@@ -119,7 +119,7 @@ public:
             else {
                 if (k > 0) --k;
                 uint32_t j = sa[r - 1];
-                while (i + k < n && j + k < n && s[i + k] == s[j + k]) ++k;
+                while (i + k < l && j + k < l && s[i + k] == s[j + k]) ++k;
                 height[r] = k;
             }
         }
@@ -128,7 +128,7 @@ public:
 private:
     uint32_t buffer[max_block_size * 5];
 
-    bool rank_both_equal(uint32_t* r, uint32_t a, uint32_t b, uint32_t l, uint32_t n) {
+    static bool rank_both_equal(uint32_t* r, uint32_t a, uint32_t b, uint32_t l, uint32_t n) {
         if (r[a] != r[b]) return false;
         // 如果开两倍空间，就可以省去下面的两个判断。
         if (a + l >= n && b + l >= n) return true;
@@ -365,7 +365,7 @@ inline void LZ3_write_VL48(uint8_t* dst, uint32_t& dstPos, uint32_t value)
             dst[dstPos++] = 0xFF;
             value -= 0xFF;
         }
-        dst[dstPos++] = value;
+        dst[dstPos++] = (uint8_t)value;
     }
 }
 
@@ -574,7 +574,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
                     if (o != offsets.end())
                     {
                         match = m;
-                        offsets[m.offset].push_back(index);
+                        offsets[m.offset].push_back((uint16_t)index);
                         break;
                     }
                 }
@@ -631,12 +631,12 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     uint32_t dictSize = 0;
     for (const auto& i : offsets)
     {
-        dict[dictSize++] = i.first;
+        dict[dictSize++] = (uint16_t)i.first;
     }
     sort(dict, dict + dictSize);
     uint32_t srcPos = 0;
     uint32_t dstPos = 0;
-    dst[dstPos++] = dictSize;
+    dst[dstPos++] = (uint8_t)dictSize;
     for (uint32_t i = 0; i < dictSize; ++i)
     {
         LZ3_write_VL16(dst, dstPos, dict[i]);
@@ -653,7 +653,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
         uint32_t length = match.length;
         length -= min_match_length;
         uint32_t offset = match.offset;
-        uint16_t token = (literal >= 0xF ? 0xF : literal) | ((length >= 0xF ? 0xF : length) << 4);
+        uint16_t token = (uint16_t)((literal >= 0xF ? 0xF : literal) | ((length >= 0xF ? 0xF : length) << 4));
         size_t dictIdx = find(dict, dict + dictSize, offset) - dict;
         if (dictIdx < dictSize)
         {
@@ -676,7 +676,7 @@ uint32_t LZ3_compress(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
     if (srcSize > srcPos)
     {
         uint32_t literal = srcSize - srcPos;
-        uint16_t token = (literal >= 0xF ? 0xF : literal);
+        uint16_t token = (uint16_t)((literal >= 0xF ? 0xF : literal));
         LZ3_write_LE16(dst, dstPos, token);
         LZ3_write_VL48(dst, dstPos, literal);
         memcpy(&dst[dstPos], &src[srcSize - literal], literal);
