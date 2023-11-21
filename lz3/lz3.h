@@ -32,9 +32,13 @@ extern "C" {
 
 #endif
 
-LZ3_API uint32_t LZ3_compress(const uint8_t * src, uint8_t * dst, uint32_t srcSize);
+LZ3_API uint32_t LZ3_compress(const void* src, void* dst, uint32_t srcSize);
 
-LZ3_API uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize);
+LZ3_API uint32_t LZ3_decompress_fast(const void* src, void* dst, uint32_t dstSize);
+
+LZ3_API uint32_t LZ3_compress_HUF(const void* src, void* dst, uint32_t srcSize);
+
+LZ3_API uint32_t LZ3_decompress_HUF_fast(const void* src, void* dst, uint32_t dstSize);
 
 #if defined (__cplusplus)
 }
