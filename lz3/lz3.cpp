@@ -44,6 +44,10 @@ class LZ3_suffix_array
 public:
     uint32_t n;
 
+    LZ3_suffix_array(uint32_t l) {
+        n = l;
+    }
+
     uint32_t* sa;
     uint32_t* rk;
 
@@ -52,14 +56,14 @@ public:
     //rk数组保存的值相当于是rank值。下面的操作只是用rk数组来比较字符的大小，所以没有必要求出当前真实的rank值。所以这里rk保存位置i的字符就好
     //最后返回的rk才是rank值，rk[i]=后缀i的名次
     void cal_suffix_array(const uint8_t* s, uint32_t l) {
-        uint32_t bucket_count = 256;
+        assert(l == n);
 
-        n = l;
         sa = &buffer[0];
         rk = &buffer[max_block_size];
         uint32_t* sa_2nd = &buffer[max_block_size * 2];
         uint32_t* rk_2nd = &buffer[max_block_size * 3];
         uint32_t* bucket = &buffer[max_block_size * 4];
+        uint32_t bucket_count = 256;
 
         //对第一个字符排序
         fill(bucket, bucket + bucket_count, 0);
@@ -295,7 +299,7 @@ enum LZ3_entropy_coder
 template<LZ3_entropy_coder coder>
 LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
-    LZ3_suffix_array* psa = new LZ3_suffix_array();
+    LZ3_suffix_array* psa = new LZ3_suffix_array(srcSize);
     psa->cal_suffix_array(src, srcSize);
     psa->cal_height(src, srcSize);
 #if defined(LZ3_LOG) && !defined(NDEBUG)
@@ -622,24 +626,37 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
             size_t dstSize;
             if (coder == LZ3_entropy_coder::Huff0)
             {
-                LZ3_write_LE16(dst, dstPos, (uint16_t)oriSize);
-                dstSize = HUF_compress(&dst[dstPos + sizeof(uint16_t)], HUF_compressBound(oriSize), stream->data(), oriSize);
-                if (HUF_isError(dstSize) || dstSize == 0)
+                dstSize = HUF_compress(&dst[dstPos + sizeof(uint16_t) * 2], HUF_compressBound(oriSize), stream->data(), oriSize);
+                if (HUF_isError(dstSize))
                 {
                     LZ3_last_error_name = HUF_getErrorName(oriSize);
                     return -1;
                 }
-                LZ3_write_LE16(dst, dstPos, (uint16_t)dstSize);
+                if (dstSize != 0)
+                {
+                    LZ3_write_LE16(dst, dstPos, (uint16_t)dstSize);
+                    LZ3_write_LE16(dst, dstPos, (uint16_t)oriSize);
+                }
             }
             else
             {
-                dstSize = FSE_compress(&dst[dstPos + sizeof(uint16_t)], FSE_compressBound(oriSize), stream->data(), oriSize);
-                if (FSE_isError(dstSize) || dstSize == 0)
+                dstSize = FSE_compress(&dst[dstPos + sizeof(uint16_t) * 1], FSE_compressBound(oriSize), stream->data(), oriSize);
+                if (FSE_isError(dstSize))
                 {
                     LZ3_last_error_name = FSE_getErrorName(oriSize);
                     return -1;
                 }
+                if (dstSize != 0)
+                {
+                    LZ3_write_LE16(dst, dstPos, (uint16_t)dstSize);
+                }
+            }
+            if (dstSize == 0)
+            {
                 LZ3_write_LE16(dst, dstPos, (uint16_t)dstSize);
+                LZ3_write_LE16(dst, dstPos, (uint16_t)oriSize);
+                memcpy(&dst[dstPos], stream->data(), oriSize);
+                dstSize = oriSize;
             }
             dstPos += (uint32_t)dstSize;
         }
@@ -664,12 +681,18 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
     vector<uint8_t> oStream;
     for (auto stream : { &uStream, &lStream, &mStream, &oStream })
     {
-        size_t srcSize;
-        size_t oriSize;;
-        if (coder == LZ3_entropy_coder::Huff0)
+        size_t srcSize = LZ3_read_LE16(src, srcPos);
+        size_t oriSize;
+        if (srcSize == 0)
         {
             oriSize = LZ3_read_LE16(src, srcPos);
-            srcSize = LZ3_read_LE16(src, srcPos);
+            stream->resize(oriSize);
+            memcpy(stream->data(), &src[srcPos], oriSize);
+            srcSize = oriSize;
+        }
+        else if (coder == LZ3_entropy_coder::Huff0)
+        {
+            oriSize = LZ3_read_LE16(src, srcPos);
             stream->resize(oriSize);
             oriSize = HUF_decompress(stream->data(), oriSize, &src[srcPos], srcSize);
             if (HUF_isError(oriSize))
@@ -678,9 +701,8 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
                 return -1;
             }
         }
-        else
+        else if (coder == LZ3_entropy_coder::FSE)
         {
-            srcSize = LZ3_read_LE16(src, srcPos);
             stream->resize(dstSize);
             oriSize = FSE_decompress(stream->data(), dstSize, &src[srcPos], srcSize);
             if (FSE_isError(oriSize))
