@@ -1,5 +1,6 @@
 ﻿#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
@@ -296,6 +297,9 @@ enum LZ3_entropy_coder
     FSE,
 };
 
+uint32_t block_mode_threshold = 16;
+uint32_t dim_2_mode_threshold = 64;
+
 template<LZ3_entropy_coder coder>
 LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, uint32_t srcSize)
 {
@@ -564,12 +568,66 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
     }
     else
     {
+        uint32_t srcPos = 0;
+        uint32_t dstPos = 0;
+        vector<uint32_t> hist;
+        uint32_t total = 0;
+        for (const auto& i : offsets)
+        {
+            if (i.second >= min_match_offset)
+            {
+                hist.push_back(i.first);
+            }
+            total += i.second;
+        }
+        stable_sort(hist.begin(), hist.end(), [&offsets](uint32_t x, uint32_t y)
+        {
+            return offsets[x] > offsets[y];
+        });
+        uint32_t blockLog = 4;
+        for (; blockLog >= 3; --blockLog)
+        {
+            uint32_t incap = 0;
+            for (uint32_t offset : hist)
+            {
+                if (offset % (1 << blockLog) != 0)
+                {
+                    incap += offsets[offset];
+                }
+            }
+            if (incap <= total / block_mode_threshold)
+            {
+                break;
+            }
+        }
+        //ASTC_6x6/12x12 may have NPOT row size
+        uint32_t lineSize = 256;
+        if (blockLog >= 3)
+        {
+            for (uint32_t offset : hist)
+            {
+                if (offset % (1 << blockLog) == 0 && (offset >> blockLog) > dim_2_mode_threshold)
+                {
+                    lineSize = offset >> blockLog;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            blockLog = 0;
+        }
+        if (lineSize > 256)
+        {
+            lineSize = 256;
+        }
+        dst[dstPos++] = blockLog;
+        dst[dstPos++] = lineSize;
         vector<uint8_t> uStream;
         vector<uint8_t> lStream;
         vector<uint8_t> mStream;
-        vector<uint8_t> oStream;
-        uint32_t srcPos = 0;
-        uint32_t dstPos = 0;
+        vector<uint8_t> xStream;
+        vector<uint8_t> yStream;
         for (uint32_t index : matches)
         {
             const LZ3_match_info& match = candidates[index];
@@ -602,7 +660,19 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
                 mStream.push_back(0xFF);
                 copy((uint8_t*)&length, (uint8_t*)&length + sizeof(uint16_t), back_inserter(mStream));
             }
-            copy((uint8_t*)&offset, (uint8_t*)&offset + sizeof(uint16_t), back_inserter(oStream));
+            if (blockLog > 0)
+            {
+                uint8_t x = (offset >> blockLog) % lineSize;
+                uint8_t y = (offset >> blockLog) / lineSize;
+                uint8_t r = (offset << (8 - blockLog));
+                xStream.push_back(x);
+                yStream.push_back(y | r);
+            }
+            else
+            {
+                xStream.push_back(offset & 0xFF);
+                yStream.push_back(offset >> 8);
+            }
             srcPos += match.length;
         }
         if (srcSize > srcPos)
@@ -620,7 +690,7 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
             }
             copy(&src[srcPos], &src[srcSize], back_inserter(uStream));
         }
-        for (auto stream : { &uStream, &lStream, &mStream, &oStream })
+        for (auto stream : { &uStream, &lStream, &mStream, &xStream, &yStream })
         {
             size_t oriSize = stream->size();
             size_t dstSize;
@@ -675,11 +745,18 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
     uint32_t srcPos = 0;
     uint32_t dstPos = 0;
     uint32_t dstShortEnd = dstSize > wild_cpy_length ? dstSize - wild_cpy_length : 0;
+    uint32_t blockLog = src[srcPos++];
+    uint32_t lineSize = src[srcPos++];
+    if (lineSize == 0)
+    {
+        lineSize = 256;
+    }
     uint8_t* uStream = new uint8_t[dstSize];
     uint8_t* lStream = new uint8_t[dstSize];
     uint8_t* mStream = new uint8_t[dstSize];
-    uint8_t* oStream = new uint8_t[dstSize];
-    for (auto stream : { uStream, lStream, mStream, oStream })
+    uint8_t* xStream = new uint8_t[dstSize];
+    uint8_t* yStream = new uint8_t[dstSize];
+    for (auto stream : { uStream, lStream, mStream, xStream, yStream })
     {
         size_t srcSize = LZ3_read_LE16(src, srcPos);
         size_t oriSize;
@@ -713,7 +790,8 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
     uint32_t ustPos = 0;
     uint32_t lstPos = 0;
     uint32_t mstPos = 0;
-    uint32_t ostPos = 0;
+    uint32_t xstPos = 0;
+    uint32_t ystPos = 0;
     while (true)
     {
         uint16_t literal = lStream[lstPos++];
@@ -763,8 +841,17 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
             ustPos += literal;
         }
         uint16_t offset;
-        memcpy(&offset, &oStream[ostPos], sizeof(uint16_t));
-        ostPos += 2;
+        if (blockLog > 0)
+        {
+            uint8_t x = xStream[xstPos++];
+            uint8_t y = yStream[ystPos] & ((1 << (8 - blockLog)) - 1);
+            uint8_t r = yStream[ystPos++] >> (8 - blockLog);
+            offset = ((x + y * lineSize) << blockLog) | r;
+        }
+        else
+        {
+            offset = xStream[xstPos++] | (yStream[ystPos++] << 8);
+        }
         uint16_t length = mStream[mstPos++];
         if (length <= wild_cpy_length - min_match_length)
         {
@@ -824,7 +911,8 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
     delete[] uStream;
     delete[] lStream;
     delete[] mStream;
-    delete[] oStream;
+    delete[] xStream;
+    delete[] yStream;
     return srcPos;
 }
 
