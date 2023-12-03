@@ -18,11 +18,11 @@
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
-#define LZ3_FORCE_INLINE   __attribute__((always_inline)) inline
+#define LZ3_FORCE_INLINE   static inline __attribute__((always_inline))
 #define LZ3_LIKELY(expr)   __builtin_expect(!!(expr), 1)
 #define LZ3_UNLIKELY(expr) __builtin_expect(!!(expr), 0)
 #else
-#define LZ3_FORCE_INLINE   __forceinline
+#define LZ3_FORCE_INLINE   static inline
 #define LZ3_LIKELY(expr)   (expr)
 #define LZ3_UNLIKELY(expr) (expr)
 #endif
@@ -238,33 +238,25 @@ LZ3_FORCE_INLINE uint16_t LZ3_read_VL16(const uint8_t* src, uint32_t& srcPos)
     return value;
 }
 
-LZ3_FORCE_INLINE void LZ3_write_VL48(uint8_t* dst, uint32_t& dstPos, uint32_t value)
+LZ3_FORCE_INLINE void LZ3_write_HPV8(uint8_t* dst, uint32_t& dstPos, uint32_t value)
 {
-    if (value >= 0xF)
+    while (value >= 0xFF)
     {
-        value -= 0xF;
-        while (value >= 0xFF)
-        {
-            dst[dstPos++] = 0xFF;
-            value -= 0xFF;
-        }
-        dst[dstPos++] = (uint8_t)value;
+        dst[dstPos++] = 0xFF;
+        value -= 0xFF;
     }
+    dst[dstPos++] = (uint8_t)value;
 }
 
-LZ3_FORCE_INLINE uint32_t LZ3_read_VL48(const uint8_t* src, uint32_t& srcPos, uint32_t token)
+LZ3_FORCE_INLINE uint32_t LZ3_read_HPV8(const uint8_t* src, uint32_t& srcPos, uint32_t value)
 {
-    uint32_t value = token;
-    if (token == 0xF)
+    while (true)
     {
-        while (true)
+        uint8_t e = src[srcPos++];
+        value += e;
+        if (e < 0xFF)
         {
-            uint8_t e = src[srcPos++];
-            value += e;
-            if (e < 0xFF)
-            {
-                break;
-            }
+            break;
         }
     }
     return value;
@@ -302,7 +294,7 @@ static constexpr uint32_t dim_2_mode_threshold = 64;
 static constexpr uint32_t uncompress_threshold = 32;
 static constexpr uint32_t uncompress_intercept = 0;
 
-uint32_t LZ3_write_stream(const uint8_t* src, uint8_t* dst, uint32_t srcSize, LZ3_entropy_coder coder)
+static uint32_t LZ3_write_stream(const uint8_t* src, uint8_t* dst, uint32_t srcSize, LZ3_entropy_coder coder)
 {
     uint32_t dstPos = 0;
     size_t dstSize = 0;
@@ -352,7 +344,7 @@ uint32_t LZ3_write_stream(const uint8_t* src, uint8_t* dst, uint32_t srcSize, LZ
     return dstPos;
 }
 
-uint32_t LZ3_read_stream(const uint8_t* src, uint8_t* dst, uint32_t dstCap, LZ3_entropy_coder coder)
+static uint32_t LZ3_read_stream(const uint8_t* src, uint8_t* dst, uint32_t dstCap, LZ3_entropy_coder coder)
 {
     uint32_t srcPos = 0;
     size_t srcSize = LZ3_read_LE16(src, srcPos);
@@ -633,12 +625,18 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
                 token |= offset & 0x7F00;
             }
             LZ3_write_LE16(dst, dstPos, token);
-            LZ3_write_VL48(dst, dstPos, literal);
+            if (literal >= 0xF)
+            {
+                LZ3_write_HPV8(dst, dstPos, literal - 0xF);
+            }
             memcpy(&dst[dstPos], &src[srcPos], literal);
             dstPos += literal;
             srcPos += literal;
             LZ3_write_VL78(dst, dstPos, token, offset);
-            LZ3_write_VL48(dst, dstPos, length);
+            if (length >= 0xF)
+            {
+                LZ3_write_HPV8(dst, dstPos, length - 0xF);
+            }
             srcPos += match.length;
         }
         if (srcSize > srcPos)
@@ -646,7 +644,10 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
             uint32_t literal = srcSize - srcPos;
             uint16_t token = (uint16_t)((literal >= 0xF ? 0xF : literal));
             LZ3_write_LE16(dst, dstPos, token);
-            LZ3_write_VL48(dst, dstPos, literal);
+            if (literal >= 0xF)
+            {
+                LZ3_write_HPV8(dst, dstPos, literal - 0xF);
+            }
             memcpy(&dst[dstPos], &src[srcSize - literal], literal);
             dstPos += literal;
         }
@@ -709,11 +710,8 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
         }
         dst[dstPos++] = blockLog;
         dst[dstPos++] = lineSize;
-        vector<uint8_t> uStream;
-        vector<uint8_t> lStream;
-        vector<uint8_t>& xStream = lStream;
-        vector<uint8_t>& yStream = lStream;
-        vector<uint8_t>& mStream = lStream;
+        vector<uint8_t> lit;
+        vector<uint8_t> seq;
         for (uint32_t index : matches)
         {
             const LZ3_match_info& match = candidates[index];
@@ -726,15 +724,15 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
             uint32_t length = match.length;
             length -= min_match_length;
             uint32_t offset = match.offset;
-            copy(&src[srcPos], &src[position], back_inserter(uStream));
+            copy(&src[srcPos], &src[position], back_inserter(lit));
             if (literal < 0xFF)
             {
-                lStream.push_back((uint8_t)literal);
+                seq.push_back((uint8_t)literal);
             }
             else
             {
-                lStream.push_back(0xFF);
-                copy((uint8_t*)&literal, (uint8_t*)&literal + sizeof(uint16_t), back_inserter(lStream));
+                seq.push_back(0xFF);
+                copy((uint8_t*)&literal, (uint8_t*)&literal + sizeof(uint16_t), back_inserter(seq));
             }
             srcPos += literal;
             if (blockLog > 0)
@@ -742,22 +740,21 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
                 uint8_t x = (offset >> blockLog) % lineSize;
                 uint8_t y = (offset >> blockLog) / lineSize;
                 uint8_t r = (offset << (8 - blockLog));
-                xStream.push_back(x);
-                yStream.push_back(y | r);
+                seq.push_back(x);
+                seq.push_back(y | r);
             }
             else
             {
-                xStream.push_back(offset & 0xFF);
-                yStream.push_back(offset >> 8);
+                copy((uint8_t*)&offset, (uint8_t*)&offset + sizeof(uint16_t), back_inserter(seq));
             }
             if (length < 0xFF)
             {
-                mStream.push_back((uint8_t)length);
+                seq.push_back((uint8_t)length);
             }
             else
             {
-                mStream.push_back(0xFF);
-                copy((uint8_t*)&length, (uint8_t*)&length + sizeof(uint16_t), back_inserter(mStream));
+                seq.push_back(0xFF);
+                copy((uint8_t*)&length, (uint8_t*)&length + sizeof(uint16_t), back_inserter(seq));
             }
             srcPos += match.length;
         }
@@ -766,21 +763,18 @@ LZ3_FORCE_INLINE uint32_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst,
             uint32_t literal = srcSize - srcPos;
             if (literal < 0xFF)
             {
-                lStream.push_back((uint8_t)literal);
+                seq.push_back((uint8_t)literal);
             }
             else
             {
-                lStream.push_back(0xFF);
+                seq.push_back(0xFF);
                 uint16_t val = (uint16_t)literal;
-                copy((uint8_t*)&val, ((uint8_t*)&val) + sizeof(uint16_t), back_inserter(lStream));
+                copy((uint8_t*)&val, ((uint8_t*)&val) + sizeof(uint16_t), back_inserter(seq));
             }
-            copy(&src[srcPos], &src[srcSize], back_inserter(uStream));
+            copy(&src[srcPos], &src[srcSize], back_inserter(lit));
         }
-        dstPos += LZ3_write_stream(uStream.data(), &dst[dstPos], (uint32_t)uStream.size(), LZ3_entropy_coder::Huff0);
-        dstPos += LZ3_write_stream(lStream.data(), &dst[dstPos], (uint32_t)lStream.size(), LZ3_entropy_coder::Huff0);
-        //dstPos += LZ3_write_stream(xStream.data(), &dst[dstPos], (uint32_t)xStream.size(), LZ3_entropy_coder::Huff0);
-        //dstPos += LZ3_write_stream(yStream.data(), &dst[dstPos], (uint32_t)yStream.size(), LZ3_entropy_coder::Huff0);
-        //dstPos += LZ3_write_stream(mStream.data(), &dst[dstPos], (uint32_t)mStream.size(), LZ3_entropy_coder::Huff0);
+        dstPos += LZ3_write_stream(lit.data(), &dst[dstPos], (uint32_t)lit.size(), LZ3_entropy_coder::Huff0);
+        dstPos += LZ3_write_stream(seq.data(), &dst[dstPos], (uint32_t)seq.size(), LZ3_entropy_coder::Huff0);
         return dstPos;
     }
 }
@@ -796,56 +790,100 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
     uint32_t srcPos = 0;
     uint32_t dstPos = 0;
     uint32_t dstShortEnd = dstSize > wild_cpy_length ? dstSize - wild_cpy_length : 0;
-    uint32_t blockLog = src[srcPos++];
-    uint32_t lineSize = src[srcPos++];
-    if (lineSize == 0)
+
+    uint16_t dict[128];
+    const uint16_t* dictPre = dict - 128;
+
+    uint32_t blockLog = 0;
+    uint32_t lineSize = 0;
+    const uint8_t* lit = nullptr;
+    const uint8_t* seq = nullptr;
+    uint32_t litPos = 0;
+    uint32_t seqPos = 0;
+    if (coder == LZ3_entropy_coder::None)
     {
-        lineSize = 256;
+        uint32_t dictSize = src[srcPos++];
+        for (uint32_t i = 0; i < dictSize; ++i)
+        {
+            dict[i] = LZ3_read_VL16(src, srcPos);
+        }
+        lit = src;
+        seq = src;
     }
-    uint8_t* uStream = new uint8_t[dstSize * 5];
-    uint8_t* lStream = uStream + dstSize;
-    uint8_t* xStream = lStream;
-    uint8_t* yStream = lStream;
-    uint8_t* mStream = lStream;
-    srcPos += LZ3_read_stream(&src[srcPos], uStream, dstSize, LZ3_entropy_coder::Huff0);
-    srcPos += LZ3_read_stream(&src[srcPos], lStream, dstSize, LZ3_entropy_coder::Huff0);
-    //srcPos += LZ3_read_stream(&src[srcPos], xStream, dstSize, LZ3_entropy_coder::Huff0);
-    //srcPos += LZ3_read_stream(&src[srcPos], yStream, dstSize, LZ3_entropy_coder::Huff0);
-    //srcPos += LZ3_read_stream(&src[srcPos], mStream, dstSize, LZ3_entropy_coder::Huff0);
-    uint32_t ustPos = 0;
-    uint32_t lstPos = 0;
-    uint32_t& mstPos = lstPos;
-    uint32_t& xstPos = lstPos;
-    uint32_t& ystPos = lstPos;
+    else
+    {
+        blockLog = src[srcPos++];
+        lineSize = src[srcPos++];
+        if (lineSize == 0)
+        {
+            lineSize = 256;
+        }
+        uint8_t* buf = new uint8_t[dstSize * 5];
+        srcPos += LZ3_read_stream(&src[srcPos], buf, dstSize, LZ3_entropy_coder::Huff0);
+        lit = buf;
+        buf += dstSize;
+        srcPos += LZ3_read_stream(&src[srcPos], buf, dstSize, LZ3_entropy_coder::Huff0);
+        seq = buf;
+    }
     while (true)
     {
-        uint16_t literal = lStream[lstPos++];
-        if (LZ3_LIKELY(literal <= wild_cpy_length))
+        uint16_t token;
+        uint32_t literal;
+        uint32_t length;
+        if (coder == LZ3_entropy_coder::None)
+        {
+            token = LZ3_read_LE16(src, srcPos);
+            literal = token & 15;
+            length = ((uint8_t)token) >> 4;
+        }
+        else
+        {
+            literal = seq[seqPos++];
+        }
+        if (LZ3_LIKELY(literal <= min(wild_cpy_length, coder == LZ3_entropy_coder::None ? 0xEu : 0xFFu)))
         {
             if (LZ3_UNLIKELY(dstPos >= dstShortEnd))
             {
                 goto safe_copy_literal;
             }
+            uint32_t refPos = coder == LZ3_entropy_coder::None ? srcPos : litPos;
             //TODO by Lysine: copy literal may read beyond stream end
-            memcpy(&dst[dstPos], &uStream[ustPos], wild_cpy_length);
+            memcpy(&dst[dstPos], &lit[refPos], wild_cpy_length);
             dstPos += literal;
-            ustPos += literal;
+            if (coder == LZ3_entropy_coder::None)
+            {
+                srcPos += literal;
+            }
+            else
+            {
+                litPos += literal;
+            }
         }
         else
         {
-            if (literal == 0xFF)
+            if (coder == LZ3_entropy_coder::None)
             {
-                literal = LZ3_read_LE16(lStream, lstPos);
+                if (literal >= 0xF)
+                {
+                    literal = LZ3_read_HPV8(src, srcPos, literal);
+                }
+            }
+            else
+            {
+                if (literal >= 0xFF)
+                {
+                    literal = LZ3_read_LE16(seq, seqPos);
+                }
             }
         safe_copy_literal:
             uint32_t cpyEnd = dstPos + literal;
             uint32_t cpyPos = dstPos;
-            uint32_t refPos = ustPos;
+            uint32_t refPos = coder == LZ3_entropy_coder::None ? srcPos : litPos;
             if (cpyEnd <= dstShortEnd)
             {
                 while(cpyPos < cpyEnd)
                 {
-                    memcpy(&dst[cpyPos], &uStream[refPos], wild_cpy_length);
+                    memcpy(&dst[cpyPos], &lit[refPos], wild_cpy_length);
                     cpyPos += wild_cpy_length;
                     refPos += wild_cpy_length;
                 }
@@ -855,31 +893,43 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
                 assert(cpyEnd <= dstSize);
                 while(cpyPos < cpyEnd)
                 {
-                    dst[cpyPos++] = uStream[refPos++];
+                    dst[cpyPos++] = lit[refPos++];
                 }
             }
             dstPos += literal;
+            if (coder == LZ3_entropy_coder::None)
+            {
+                srcPos += literal;
+            }
+            else
+            {
+                litPos += literal;
+            }
             if (dstPos == dstSize)
             {
                 break;
             }
-            ustPos += literal;
         }
-        uint16_t offset;
-        if (blockLog > 0)
+        uint32_t offset;
+        if (coder == LZ3_entropy_coder::None)
         {
-            uint8_t x = xStream[xstPos++];
-            uint8_t y = yStream[ystPos] & ((1 << (8 - blockLog)) - 1);
-            uint8_t r = yStream[ystPos++] >> (8 - blockLog);
-            offset = ((x + y * lineSize) << blockLog) | r;
+            offset = LZ3_read_VL78(src, srcPos, token, dictPre);
         }
         else
         {
-            uint8_t x = xStream[xstPos++];
-            uint8_t y = yStream[ystPos++];
-            offset = x | (y << 8);
+            if (blockLog != 0)
+            {
+                uint8_t x = seq[seqPos++];
+                uint8_t y = seq[seqPos] & ((1 << (8 - blockLog)) - 1);
+                uint8_t r = seq[seqPos++] >> (8 - blockLog);
+                offset = ((x + y * lineSize) << blockLog) | r;
+            }
+            else
+            {
+                offset = LZ3_read_LE16(seq, seqPos);
+            }
+            length = seq[seqPos++];
         }
-        uint16_t length = mStream[mstPos++];
         if (LZ3_LIKELY(length <= wild_cpy_length - min_match_length))
         {
             length += min_match_length;
@@ -897,9 +947,19 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
         }
         else
         {
-            if (length == 0xFF)
+            if (coder == LZ3_entropy_coder::None)
             {
-                length = LZ3_read_LE16(mStream, mstPos);
+                if (length >= 0xF)
+                {
+                    length = LZ3_read_HPV8(src, srcPos, length);
+                }
+            }
+            else
+            {
+                if (length >= 0xFF)
+                {
+                    length = LZ3_read_LE16(seq, seqPos);
+                }
             }
             length += min_match_length;
         safe_copy_match:
@@ -936,127 +996,9 @@ LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic(const uint8_t* src, uint8_t* ds
             }
         }
     }
-    delete[] uStream;
-    return srcPos;
-}
-
-template<>
-LZ3_FORCE_INLINE uint32_t LZ3_decompress_generic<LZ3_entropy_coder::None>(const uint8_t* src, uint8_t* dst, uint32_t dstSize)
-{
-#if defined(LZ3_LOG) && !defined(NDEBUG)
-    ofstream dfs("LZ3_decompress.log");
-#endif
-    uint32_t srcPos = 0;
-    uint32_t dstPos = 0;
-    uint32_t dstShortEnd = dstSize > wild_cpy_length ? dstSize - wild_cpy_length : 0;
-    uint16_t dict[128];
-    uint32_t dictSize = src[srcPos++];
-    for (uint32_t i = 0; i < dictSize; ++i)
+    if (lit != src)
     {
-        dict[i] = LZ3_read_VL16(src, srcPos);
-    }
-    const uint16_t* dictPre = dict - 128;
-    while (true)
-    {
-        uint16_t token = LZ3_read_LE16(src, srcPos);
-        uint32_t literal = token & 15;
-        uint32_t length = ((uint8_t)token) >> 4;
-        uint32_t offset;
-        if (LZ3_LIKELY(literal <= min(wild_cpy_length, 14u)))
-        {
-            if (LZ3_UNLIKELY(dstPos >= dstShortEnd))
-            {
-                goto safe_copy_literal;
-            }
-            //TODO by Lysine: copy literal may read beyond input end
-            memcpy(&dst[dstPos], &src[srcPos], wild_cpy_length);
-            dstPos += literal;
-            srcPos += literal;
-            offset = LZ3_read_VL78(src, srcPos, token, dictPre);
-        }
-        else
-        {
-            literal = LZ3_read_VL48(src, srcPos, literal);
-        safe_copy_literal:
-            uint32_t cpyEnd = dstPos + literal;
-            uint32_t cpyPos = dstPos;
-            uint32_t refPos = srcPos;
-            if (cpyEnd <= dstShortEnd)
-            {
-                while(cpyPos < cpyEnd)
-                {
-                    memcpy(&dst[cpyPos], &src[refPos], wild_cpy_length);
-                    cpyPos += wild_cpy_length;
-                    refPos += wild_cpy_length;
-                }
-            }
-            else
-            {
-                assert(cpyEnd <= dstSize);
-                while(cpyPos < cpyEnd)
-                {
-                    dst[cpyPos++] = src[refPos++];
-                }
-            }
-            dstPos += literal;
-            srcPos += literal;
-            if (dstPos == dstSize)
-            {
-                break;
-            }
-            offset = LZ3_read_VL78(src, srcPos, token, dictPre);
-        }
-        if (LZ3_LIKELY(length <= min(wild_cpy_length - min_match_length, 14u)))
-        {
-            length = length + min_match_length;
-            if (LZ3_UNLIKELY(dstPos >= dstShortEnd || offset < wild_cpy_length))
-            {
-                goto safe_copy_match;
-            }
-            assert(dstPos >= offset);
-            uint32_t refPos = dstPos - offset;
-            memcpy(&dst[dstPos], &dst[refPos], wild_cpy_length);
-#if defined(LZ3_LOG) && !defined(NDEBUG)
-            dfs << dstPos << ": " << length << " " << offset << endl;
-#endif
-            dstPos += length;
-        }
-        else
-        {
-            length = LZ3_read_VL48(src, srcPos, length) + min_match_length;
-        safe_copy_match:
-            assert(dstPos >= offset);
-            uint32_t cpyEnd = dstPos + length;
-            uint32_t cpyPos = dstPos;
-            uint32_t refPos = dstPos - offset;
-            if (cpyEnd <= dstShortEnd/*dstEnd - (wild_cpy_length - 1)*/ && offset >= wild_cpy_length)
-            {
-                do
-                {
-                    memcpy(&dst[cpyPos], &dst[refPos], wild_cpy_length);
-                    cpyPos += wild_cpy_length;
-                    refPos += wild_cpy_length;
-                }
-                while(cpyPos < cpyEnd);
-            }
-            else
-            {
-                assert(cpyEnd <= dstSize);
-                do
-                {
-                    dst[cpyPos++] = dst[refPos++];
-                }
-                while(cpyPos < cpyEnd);
-            }
-#if defined(LZ3_LOG) && !defined(NDEBUG)
-            dfs << dstPos << ": " << length << " " << offset << endl;
-#endif
-            dstPos += length;
-            if (dstPos == dstSize)
-            {
-                break;
-            }
-        }
+        delete[] lit;
     }
     return srcPos;
 }
