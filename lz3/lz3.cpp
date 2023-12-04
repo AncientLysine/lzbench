@@ -169,19 +169,19 @@ public:
         while (true)
         {
             uint32_t index;
-            if (prev > 0 && psa->height[prev] >= psa->height[next])
+            if (prev == 0 && next >= psa->n)
+            {
+                return false;
+            }
+            if (next >= psa->n || psa->height[prev] >= psa->height[next])
             {
                 length = min(length, psa->height[prev]);
                 index = psa->sa[--prev];
             }
-            else if (next < psa->n)
+            else
             {
                 length = min(length, psa->height[next]);
                 index = psa->sa[next++];
-            }
-            else
-            {
-                return false;
             }
             if (length < min_match_length)
             {
@@ -587,7 +587,7 @@ LZ3_FORCE_INLINE size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, s
         }
         stable_sort(dict.begin(), dict.end(), [&offsets](uint32_t x, uint32_t y)
         {
-            return offsets[x] > offsets[y];
+            return offsets[x] != offsets[y] ? offsets[x] > offsets[y] : x < y;
         });
         if (dict.size() > 128)
         {
@@ -669,7 +669,7 @@ LZ3_FORCE_INLINE size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, s
         }
         stable_sort(hist.begin(), hist.end(), [&offsets](uint32_t x, uint32_t y)
         {
-            return offsets[x] > offsets[y];
+            return offsets[x] != offsets[y] ? offsets[x] > offsets[y] : x < y;
         });
         uint32_t blockLog = 4;
         for (; blockLog >= 3; --blockLog)
