@@ -40,6 +40,22 @@ LZ3_API uint32_t LZ3_compress_HUF(const void* src, void* dst, uint32_t srcSize);
 
 LZ3_API uint32_t LZ3_decompress_HUF_fast(const void* src, void* dst, uint32_t dstSize);
 
+typedef struct LZ3_CStream LZ3_CStream;
+
+typedef struct LZ3_DStream LZ3_DStream;
+
+LZ3_CStream* LZ3_createCStream();
+
+LZ3_DStream* LZ3_createDStream();
+
+void LZ3_freeCStream(LZ3_CStream* pcs);
+
+void LZ3_freeDStream(LZ3_DStream* pds);
+
+uint32_t LZ3_compress_continue(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize);
+
+uint32_t LZ3_decompress_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
+
 #if defined (__cplusplus)
 }
 #endif
