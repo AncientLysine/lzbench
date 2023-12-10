@@ -56,6 +56,10 @@ uint32_t LZ3_compress_continue(LZ3_CStream* pcs, const void* src, void* dst, uin
 
 uint32_t LZ3_decompress_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
 
+uint32_t LZ3_compress_HUF_continue(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize);
+
+uint32_t LZ3_decompress_HUF_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
+
 #if defined (__cplusplus)
 }
 #endif
