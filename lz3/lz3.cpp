@@ -374,8 +374,10 @@ enum LZ3_entropy_coder
     FSE,
 };
 
-static constexpr uint32_t block_mode_threshold = 16;
-static constexpr uint32_t dim_2_mode_threshold = 64;
+static constexpr uint32_t block_mode_threshold = 10;
+static constexpr uint32_t dim_2_mode_tolerance = 8;
+static constexpr uint32_t dim_2_mode_threshold = 2;
+static constexpr uint32_t dim_2_mode_stepping = 8;
 static constexpr uint32_t uncompress_threshold = 32;
 static constexpr uint32_t uncompress_intercept = 0;
 
@@ -750,52 +752,72 @@ LZ3_FORCE_INLINE size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const 
             if (i.second >= min_match_offset)
             {
                 hist.push_back(i.first);
+                total += i.second;
             }
-            total += i.second;
         }
         stable_sort(hist.begin(), hist.end(), [&offsets](uint32_t x, uint32_t y)
         {
             return offsets[x] != offsets[y] ? offsets[x] > offsets[y] : x < y;
         });
-        uint32_t blockLog = 4;
-        for (; blockLog >= 3; --blockLog)
+        uint32_t blockLog = 0;
+        for (uint32_t i = 4; i >= 3; --i)
         {
             uint32_t incap = 0;
             for (uint32_t offset : hist)
             {
-                if (offset % (1 << blockLog) != 0)
+                if (offset % (1 << i) != 0)
                 {
                     incap += offsets[offset];
                 }
             }
             if (incap <= total / block_mode_threshold)
             {
+                blockLog = i;
                 break;
             }
         }
-        //ASTC_6x6/12x12 may have NPOT row size
-        uint32_t lineSize = 256;
-        if (blockLog >= 3)
+        //ASTC may have NPOT line size
+        uint32_t lineBest = total;
+        uint32_t lineSize = 0;
+        for (uint32_t o : hist)
         {
+            if (o % (1 << blockLog) != 0)
+            {
+                continue;
+            }
+            uint32_t incap = 0;
+            uint32_t divisor = o >> blockLog;
+            if (divisor > 256)
+            {
+                continue;
+            }
+            uint32_t min = divisor / dim_2_mode_tolerance;
+            uint32_t max = divisor - min;
             for (uint32_t offset : hist)
             {
-                if (offset % (1 << blockLog) == 0 && (offset >> blockLog) > dim_2_mode_threshold)
+                if (offset % (1 << blockLog) != 0)
                 {
-                    lineSize = offset >> blockLog;
-                    break;
+                    continue;
+                }
+                uint32_t x = (offset >> blockLog) % divisor;
+                uint32_t y = (offset >> blockLog) / divisor;
+                if ((x >= min && x < max) || y >= min)
+                {
+                    incap += offsets[offset];
                 }
             }
-        }
-        else
-        {
-            blockLog = 0;
-        }
-        if (lineSize > 256)
-        {
-            lineSize = 256;
+            if (incap < total / dim_2_mode_threshold && incap < (lineBest - lineBest / dim_2_mode_stepping))
+            {
+                lineBest = incap;
+                lineSize = divisor;
+            }
         }
         *dstPtr++ = blockLog;
         *dstPtr++ = lineSize;
+        if (lineSize == 0)
+        {
+            lineSize = 256;
+        }
         vector<uint8_t> lit;
         vector<uint8_t> seq;
         for (uint32_t index : matches)
@@ -821,16 +843,17 @@ LZ3_FORCE_INLINE size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const 
                 copy((uint8_t*)&literal, (uint8_t*)&literal + sizeof(uint16_t), back_inserter(seq));
             }
             srcPos += literal;
-            if (blockLog > 0)
+            if ((offset & ((1 << blockLog) - 1)) == 0 && ((offset >> blockLog) / lineSize) < 256)
             {
                 uint8_t x = (offset >> blockLog) % lineSize;
                 uint8_t y = (offset >> blockLog) / lineSize;
-                uint8_t r = (offset << (8 - blockLog));
                 seq.push_back(x);
-                seq.push_back(y | r);
+                seq.push_back(y);
             }
             else
             {
+                seq.push_back(0);
+                seq.push_back(0);
                 copy((uint8_t*)&offset, (uint8_t*)&offset + sizeof(uint16_t), back_inserter(seq));
             }
             if (length < 0xFF)
@@ -1021,12 +1044,12 @@ LZ3_FORCE_INLINE size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst,
         }
         else
         {
-            if (blockLog != 0)
+            offset = LZ3_read_LE16(seqPtr);
+            if (LZ3_LIKELY(offset != 0))
             {
-                uint8_t x = (*seqPtr++);
-                uint8_t y = (*seqPtr) & ((1 << (8 - blockLog)) - 1);
-                uint8_t r = (*seqPtr++) >> (8 - blockLog);
-                offset = ((x + y * lineSize) << blockLog) | r;
+                uint32_t x = offset & 0xFF;
+                uint32_t y = offset >> 8;;
+                offset = (x + y * lineSize) << blockLog;
             }
             else
             {
