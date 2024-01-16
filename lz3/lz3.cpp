@@ -1220,10 +1220,12 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
         flag = LZ3_compress_flag::None;
         uint32_t total = (uint32_t)matches.size();
         uint32_t repeat = 0;
-        for (uint32_t i = 2; i < matches.size(); ++i)
+        for (uint32_t i = 3; i < matches.size(); ++i)
         {
             uint32_t offset = candidates[matches[i]].offset;
-            if (offset == candidates[matches[i - 1]].offset || offset == candidates[matches[i - 2]].offset)
+            if (offset == candidates[matches[i - 1]].offset ||
+                offset == candidates[matches[i - 2]].offset ||
+                offset == candidates[matches[i - 3]].offset)
             {
                 repeat++;
             }
