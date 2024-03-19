@@ -355,7 +355,7 @@ LZ3_FORCE_INLINE static uint32_t LZ3_read_HPV8(const uint8_t*& src, uint32_t val
     return value;
 }
 
-LZ3_FORCE_INLINE static void LZ3_write_VL78(uint8_t*& dst, uint32_t token, uint32_t value)
+LZ3_FORCE_INLINE static void LZ3_write_VL78(uint8_t*& dst, uint16_t token, uint32_t value)
 {
     if ((token & 0x8000) == 0)
     {
@@ -363,7 +363,7 @@ LZ3_FORCE_INLINE static void LZ3_write_VL78(uint8_t*& dst, uint32_t token, uint3
     }
 }
 
-LZ3_FORCE_INLINE static uint32_t LZ3_read_VL78(const uint8_t*& src, uint32_t token, const uint16_t* dictPre)
+LZ3_FORCE_INLINE static uint32_t LZ3_read_VL78(const uint8_t*& src, uint16_t token, const uint16_t* dict)
 {
     if ((token & 0x8000) == 0)
     {
@@ -371,7 +371,7 @@ LZ3_FORCE_INLINE static uint32_t LZ3_read_VL78(const uint8_t*& src, uint32_t tok
     }
     else
     {
-        return dictPre[token >> 8];
+        return dict[(token >> 8) & 0x7F];
     }
 }
 
@@ -744,13 +744,20 @@ LZ3_FORCE_INLINE static LZ3_decode_off_result LZ3_decode_off(const uint8_t* seqP
             b = dctx.blockLog;
         if (codeEnd == 0)
             e = dctx.of_size;
-        d = c < e;
+        if (c >= e)
+        {
+            uint32_t r = (uint32_t)BIT_readBitsFast(&dctx.bitStr, b);
+            auto result = LZ3_decode_off<0, lineSize, 0, flag ^ LZ3_compress_flag::OffsetBlock>(seqPtr, dctx);
+            result.offset = (result.offset << b) | r;
+            result.seqLen += 1;
+            return result;
+        }
     }
     if (flag & LZ3_compress_flag::OffsetTwoDim)
     {
         if (lineSize == 0)
             l = dctx.lineSize;
-        if (u < 33 && d)
+        if (u < 33)
         {
             uint32_t x = dctx.of_base[c];
             /*if ((u % 2) == 0)
@@ -764,7 +771,7 @@ LZ3_FORCE_INLINE static LZ3_decode_off_result LZ3_decode_off(const uint8_t* seqP
             uint32_t y = *seqPtr++;
             return { (x + y * l) << b, 2 };
         }
-        if (d)
+        else
         {
             uint32_t x = dctx.of_base[c] + (uint32_t)BIT_readBitsFast(&dctx.bitStr, dctx.of_bits[c]);
             uint32_t y = *seqPtr++;
@@ -773,25 +780,14 @@ LZ3_FORCE_INLINE static LZ3_decode_off_result LZ3_decode_off(const uint8_t* seqP
     }
     else
     {
-        if (u < 4 && d)
+        if (u < 4)
         {
             return { u << b, 1 };
         }
-        if (d)
+        else
         {
             uint32_t o = dctx.of_base[c] + (uint32_t)BIT_readBitsFast(&dctx.bitStr, dctx.of_bits[c]);
             return { o << b, 1 };
-        }
-    }
-    if (flag & LZ3_compress_flag::OffsetBlock)
-    {
-        if (!d)
-        {
-            uint32_t r = (uint32_t)BIT_readBitsFast(&dctx.bitStr, b);
-            auto result = LZ3_decode_off<0, lineSize, 0, flag^ LZ3_compress_flag::OffsetBlock>(seqPtr, dctx);
-            result.offset = (result.offset << b) | r;
-            result.seqLen += 1;
-            return result;
         }
     }
     LZ3_UNREACHABLE;
@@ -1398,7 +1394,6 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     uint8_t* dstShortEnd = dstSize > wild_cpy_length ? dstEnd - wild_cpy_length : dstPtr;
 
     LZ3_DCtx dctx;
-    const uint16_t* dictPre = nullptr;
     LZ3_compress_flag flag = LZ3_compress_flag::None;
     LZ3_off_decoder decodeOffWrapper = nullptr;
     uint8_t* buf = nullptr;
@@ -1411,7 +1406,6 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         {
             dctx.dict[i] = LZ3_read_VL16(srcPtr);
         }
-        dictPre = dctx.dict - 128;
     }
     else
     {
@@ -1552,7 +1546,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         uint32_t offset;
         if (coder == LZ3_entropy_coder::None)
         {
-            offset = LZ3_read_VL78(srcPtr, token, dictPre);
+            offset = LZ3_read_VL78(srcPtr, token, dctx.dict);
         }
         else
         {
