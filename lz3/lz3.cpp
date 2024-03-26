@@ -1322,7 +1322,9 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
         }
         cctx.of_size = LZ3_gen_off_book(cctx.of_base, cctx.of_bits, 3, cctx.blockLog, cctx.lineSize, flag);
         vector<uint8_t> lit;
-        vector<uint8_t> seq;
+        vector<uint8_t> lls;
+        vector<uint8_t> ofs;
+        vector<uint8_t> mls;
         vector<pair<uint32_t, uint8_t>> ext;
         cctx.ext = &ext;
         fill_n(cctx.preOff, 3, 0);
@@ -1340,21 +1342,21 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             copy(&src[srcPos], &src[position], back_inserter(lit));
             if (literal <= 0xF)
             {
-                seq.push_back((uint8_t)literal);
+                lls.push_back((uint8_t)literal);
             }
             else
             {
-                LZ3_encode_seq(seq, ext, ll_base, ll_bits, 16, 34, literal);
+                LZ3_encode_seq(lls, ext, ll_base, ll_bits, 16, 34, literal);
             }
             srcPos += literal;
-            LZ3_encode_off_wrapper(seq, cctx, offset, flag);
+            LZ3_encode_off_wrapper(ofs, cctx, offset, flag);
             if (length <= 0x22)
             {
-                seq.push_back((uint8_t)length - min_match_length);
+                mls.push_back((uint8_t)length - min_match_length);
             }
             else
             {
-                LZ3_encode_seq(seq, ext, ml_base, ml_bits, 32, 51, length);
+                LZ3_encode_seq(mls, ext, ml_base, ml_bits, 32, 51, length);
             }
             srcPos += length;
         }
@@ -1363,16 +1365,18 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             uint32_t literal = (uint32_t)(srcSize - srcPos);
             if (literal <= 0xF)
             {
-                seq.push_back((uint8_t)literal);
+                lls.push_back((uint8_t)literal);
             }
             else
             {
-                LZ3_encode_seq(seq, ext, ll_base, ll_bits, 16, 34, literal);
+                LZ3_encode_seq(lls, ext, ll_base, ll_bits, 16, 34, literal);
             }
             copy(&src[srcPos], &src[srcSize], back_inserter(lit));
         }
         dstPtr += LZ3_write_stream(lit.data(), dstPtr, (uint32_t)lit.size(), LZ3_entropy_coder::Huff0);
-        dstPtr += LZ3_write_stream(seq.data(), dstPtr, (uint32_t)seq.size(), coder);
+        dstPtr += LZ3_write_stream(lls.data(), dstPtr, (uint32_t)lls.size(), coder);
+        dstPtr += LZ3_write_stream(ofs.data(), dstPtr, (uint32_t)ofs.size(), coder);
+        dstPtr += LZ3_write_stream(mls.data(), dstPtr, (uint32_t)mls.size(), coder);
         BIT_CStream_t bitStr;
         BIT_initCStream(&bitStr, dstPtr + sizeof(uint16_t), ext.size() * 2 + sizeof(size_t));
         for (size_t i = ext.size(); i > 0; --i)
@@ -1406,7 +1410,9 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     LZ3_off_decoder decodeOffWrapper = nullptr;
     uint8_t* buf = nullptr;
     const uint8_t* litPtr = nullptr;
-    const uint8_t* seqPtr = nullptr;
+    const uint8_t* llsPtr = nullptr;
+    const uint8_t* ofsPtr = nullptr;
+    const uint8_t* mlsPtr = nullptr;
     if (coder == LZ3_entropy_coder::None)
     {
         uint32_t dictSize = *srcPtr++;
@@ -1430,13 +1436,19 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         }
         dctx.of_size = LZ3_gen_off_book(dctx.of_base, dctx.of_bits, 3, dctx.blockLog, dctx.lineSize, flag);
         decodeOffWrapper = LZ3_gen_off_decoder(dctx.blockLog, dctx.lineSize, dctx.of_size, flag);
-        buf = new uint8_t[dstSize * 5];
+        buf = new uint8_t[dstSize * 4];
         uint8_t* bufPtr = buf;
         srcPtr += LZ3_read_stream(srcPtr, bufPtr, dstSize, LZ3_entropy_coder::Huff0);
         litPtr = bufPtr;
         bufPtr += dstSize;
         srcPtr += LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
-        seqPtr = bufPtr;
+        llsPtr = bufPtr;
+        bufPtr += dstSize;
+        srcPtr += LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
+        ofsPtr = bufPtr;
+        bufPtr += dstSize;
+        srcPtr += LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
+        mlsPtr = bufPtr;
         size_t bitSize = LZ3_read_LE16(srcPtr);
         BIT_initDStream(&dctx.bitStr, srcPtr, bitSize);
         srcPtr += bitSize;
@@ -1455,7 +1467,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         }
         else
         {
-            literal = *seqPtr++;
+            literal = *llsPtr++;
         }
         if (LZ3_LIKELY(literal <= min(wild_cpy_length, coder == LZ3_entropy_coder::None ? 0xEu : 0xFu)))
         {
@@ -1554,10 +1566,10 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         }
         else
         {
-            auto result = decodeOffWrapper(seqPtr, dctx);
+            auto result = decodeOffWrapper(ofsPtr, dctx);
             offset = (uint32_t)result.offset;
-            seqPtr += result.seqLen;
-            length = *seqPtr++;
+            ofsPtr += result.seqLen;
+            length = *mlsPtr++;
         }
         if (LZ3_LIKELY(length <= min(wild_cpy_length - min_match_length, coder == LZ3_entropy_coder::None ? 0xEu : 0x1Fu)))
         {
