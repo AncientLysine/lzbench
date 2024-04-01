@@ -1278,19 +1278,18 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
         //ASTC may have NPOT line size
         cctx.lineSize = 0;
         uint32_t lineBest = 0;
-        for (uint32_t o : hist)
+        for (uint32_t i = 0; i < hist.size() && i < 16u; ++i)
         {
-            if (o % (1 << cctx.blockLog) != 0)
+            if (hist[i] % (1 << cctx.blockLog) != 0)
             {
                 continue;
             }
             uint32_t count = 0;
-            uint32_t divisor = o >> cctx.blockLog;
+            uint32_t divisor = hist[i] >> cctx.blockLog;
             uint32_t sta = min((uint32_t)(divisor * dim_2_dist_tolerance), 16u);
             uint32_t end = divisor - sta;
-            for (const auto& i : offsets)
+            for (uint32_t offset : hist)
             {
-                uint32_t offset = i.first;
                 if (offset % (1 << cctx.blockLog) != 0)
                 {
                     continue;
