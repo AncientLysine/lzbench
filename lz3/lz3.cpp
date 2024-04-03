@@ -243,14 +243,14 @@ static constexpr uint32_t min_match_length = 3;
 
 static constexpr uint32_t min_offset_occur = 2;
 
-class LZ3_match_info
+class LZ3_match_iter
 {
 public:
     uint32_t position;
     uint32_t length;
     uint32_t offset;
 
-    LZ3_match_info(const LZ3_suffix_array* psa, uint32_t position) :
+    LZ3_match_iter(const LZ3_suffix_array* psa, uint32_t position) :
         position(position), length(max_block_size), offset(0)
     {
         prev = psa->rk[position];
@@ -495,6 +495,11 @@ const char* LZ3_last_error_name = nullptr;
 
 struct LZ3_CCtx
 {
+    vector<LZ3_match_iter> candidates;
+    vector<uint16_t> stained;
+    vector<uint32_t> matches;
+    uint32_t survive;
+    unordered_map<uint32_t, uint32_t> offsets;
     union
     {
         struct
@@ -503,6 +508,7 @@ struct LZ3_CCtx
         };
         struct
         {
+            vector<uint32_t>* hist;
             uint32_t blockLog;
             uint32_t lineSize;
             uint16_t of_base[64];
@@ -945,6 +951,7 @@ static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t 
 template<LZ3_entropy_coder coder>
 static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* src, uint8_t* dst, size_t srcSize)
 {
+    LZ3_CCtx cctx;
     uint32_t hisSize = psa->n - (uint32_t)srcSize;
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     ofstream sfs("LZ3_suffix_array.log");
@@ -978,22 +985,22 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
         sfs << endl;
     }
 #endif
-    vector<LZ3_match_info> candidates;
+    cctx.candidates.clear();
     for (uint32_t i = 0; i < srcSize; ++i)
     {
-        LZ3_match_info match(psa, i + hisSize);
+        LZ3_match_iter match(psa, i + hisSize);
         if (match.match_next(psa))
         {
-            candidates.push_back(match);
+            cctx.candidates.push_back(match);
         }
     }
     uint32_t maxLength = 0;
-    for (const LZ3_match_info& match : candidates)
+    for (const LZ3_match_iter& match : cctx.candidates)
     {
         maxLength = max(maxLength, match.length);
     }
     vector<uint32_t> countByLength(maxLength + 1, 0);
-    for (const LZ3_match_info& match : candidates)
+    for (const LZ3_match_iter& match : cctx.candidates)
     {
         countByLength[match.length]++;
     }
@@ -1001,35 +1008,36 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
     {
         countByLength[i - 1] += countByLength[i];
     }
-    vector<uint32_t> orderByLength(candidates.size());
-    for (auto match = candidates.cend(); match != candidates.cbegin(); )
+    vector<uint32_t> orderByLength(cctx.candidates.size());
+    for (auto match = cctx.candidates.cend(); match != cctx.candidates.cbegin(); )
     {
         --match;
         uint32_t length = match->length;
-        uint32_t index = (uint32_t)distance(candidates.cbegin(), match);
+        uint32_t index = (uint32_t)distance(cctx.candidates.cbegin(), match);
         orderByLength[--countByLength[length]] = index;
     }
-    vector<uint16_t> stained(srcSize);
-    vector<uint32_t> matches;
-    uint32_t survive = 0;
+    cctx.stained.clear();
+    cctx.stained.resize(srcSize, 0);
+    cctx.matches.clear();
+    cctx.survive = 0;
     for (auto i = orderByLength.begin(); i != orderByLength.end(); ++i)
     {
         uint32_t index = *i;
-        LZ3_match_info& match = candidates[index];
+        LZ3_match_iter& match = cctx.candidates[index];
         uint32_t length = match.length;
         if (length < min_match_length)
         {
             break;
         }
         uint32_t position = match.position - hisSize;
-        if (stained[position] != 0)
+        if (cctx.stained[position] != 0)
         {
             continue;
         }
-        if (stained[position + length - 1] != 0)
+        if (cctx.stained[position + length - 1] != 0)
         {
             length--;
-            while (length >= min_match_length && stained[position + length - 1] != 0)
+            while (length >= min_match_length && cctx.stained[position + length - 1] != 0)
             {
                 length--;
             }
@@ -1050,38 +1058,38 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             }
             continue;
         }
-        matches.push_back(index);
+        cctx.matches.push_back(index);
         if (length > min_match_length)
         {
             //match longer than 3 bytes, sure to survive
             for (uint32_t j = 0; j < length; ++j)
             {
-                stained[position + j] = (uint16_t)index + 1;
+                cctx.stained[position + j] = (uint16_t)index + 1;
             }
-            survive++;
+            cctx.survive++;
         }
     }
-    unordered_map<uint32_t, uint32_t> offsets;
-    for (uint32_t index : matches)
+    cctx.offsets.clear();
+    for (uint32_t index : cctx.matches)
     {
-        const LZ3_match_info& match = candidates[index];
+        const LZ3_match_iter& match = cctx.candidates[index];
         uint32_t offset = match.offset;
-        ++offsets[offset];
+        ++cctx.offsets[offset];
     }
-    for (uint32_t index : matches)
+    for (uint32_t index : cctx.matches)
     {
-        LZ3_match_info& match = candidates[index];
+        LZ3_match_iter& match = cctx.candidates[index];
         uint32_t offset = match.offset;
-        auto c = offsets.find(offset);
+        auto c = cctx.offsets.find(offset);
         auto n = c;
-        for (LZ3_match_info m = match; m.match_next(psa); )
+        for (LZ3_match_iter m = match; m.match_next(psa); )
         {
             if (m.length < match.length)
             {
                 break;
             }
-            auto o = offsets.find(m.offset);
-            if (o != offsets.end() && o->second > n->second)
+            auto o = cctx.offsets.find(m.offset);
+            if (o != cctx.offsets.end() && o->second > n->second)
             {
                 match = m;
                 n = o;
@@ -1093,19 +1101,19 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             n->second++;
         }
     }
-    stable_sort(matches.begin() + survive, matches.end(), [&candidates, &offsets](uint32_t x, uint32_t y)
+    stable_sort(cctx.matches.begin() + cctx.survive, cctx.matches.end(), [&cctx](uint32_t x, uint32_t y)
     {
-        return offsets[candidates[x].offset] > offsets[candidates[y].offset];
+        return cctx.offsets[cctx.candidates[x].offset] > cctx.offsets[cctx.candidates[y].offset];
     });
-    for (auto i = survive; i < matches.size(); ++i)
+    for (auto i = cctx.survive; i < cctx.matches.size(); ++i)
     {
-        uint32_t index = matches[i];
-        const LZ3_match_info& match = candidates[index];
+        uint32_t index = cctx.matches[i];
+        const LZ3_match_iter& match = cctx.candidates[index];
         uint32_t position = match.position - hisSize;
         uint32_t length = match.length;
         uint32_t offset = match.offset;
-        auto o = offsets.find(offset);
-        if (stained[position] != 0 || stained[position + length - 1] != 0)
+        auto o = cctx.offsets.find(offset);
+        if (cctx.stained[position] != 0 || cctx.stained[position + length - 1] != 0)
         {
             o->second--;
             continue;
@@ -1115,43 +1123,43 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             //match exactly 3 bytes, needs a frequent offset to survive
             for (uint32_t j = 0; j < length; ++j)
             {
-                stained[position + j] = (uint16_t)index + 1;
+                cctx.stained[position + j] = (uint16_t)index + 1;
             }
-            matches[survive] = index;
-            survive++;
+            cctx.matches[cctx.survive] = index;
+            cctx.survive++;
         }
         else
         {
             o->second--;
         }
     }
-    matches.erase(matches.begin() + survive, matches.end());
-    sort(matches.begin(), matches.end());
+    cctx.matches.erase(cctx.matches.begin() + cctx.survive, cctx.matches.end());
+    stable_sort(cctx.matches.begin(), cctx.matches.end());
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     ofstream cfs("LZ3_compress.log");
-    for (uint32_t index : matches)
+    for (uint32_t index : cctx.matches)
     {
-        const LZ3_match_info& match = candidates[index];
+        const LZ3_match_iter& match = cctx.candidates[index];
         uint32_t position = match.position - hisSize;
         uint32_t length = match.length;
         uint32_t offset = match.offset;
         cfs << position << ": " << length << " " << offset << endl;
     }
 #endif
-    LZ3_CCtx cctx;
     if (coder == LZ3_entropy_coder::None)
     {
         vector<uint32_t> dict;
-        for (const auto& i : offsets)
+        cctx.dict = &dict;
+        for (const auto& i : cctx.offsets)
         {
             if (i.second > sizeof(uint16_t)/*sizeof mode1 offset desc*/)
             {
                 dict.push_back(i.first);
             }
         }
-        stable_sort(dict.begin(), dict.end(), [&offsets](uint32_t x, uint32_t y)
+        stable_sort(dict.begin(), dict.end(), [&cctx](uint32_t x, uint32_t y)
         {
-            return offsets[x] != offsets[y] ? offsets[x] > offsets[y] : x < y;
+            return cctx.offsets[x] != cctx.offsets[y] ? cctx.offsets[x] > cctx.offsets[y] : x < y;
         });
         if (dict.size() > 128)
         {
@@ -1164,9 +1172,9 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
         {
             LZ3_write_VL16(dstPtr, (uint16_t)dict[i]);
         }
-        for (uint32_t i : matches)
+        for (uint32_t i : cctx.matches)
         {
-            const LZ3_match_info& match = candidates[i];
+            const LZ3_match_iter& match = cctx.candidates[i];
             uint32_t position = match.position - hisSize;
             if (position < srcPos)
             {
@@ -1223,14 +1231,14 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
         uint8_t* dstPtr = dst;
         LZ3_compress_flag& flag = *(LZ3_compress_flag*)(dstPtr++);
         flag = LZ3_compress_flag::None;
-        uint32_t total = (uint32_t)matches.size();
+        uint32_t total = (uint32_t)cctx.matches.size();
         uint32_t repeat = 0;
-        for (uint32_t i = 3; i < matches.size(); ++i)
+        for (uint32_t i = 3; i < cctx.matches.size(); ++i)
         {
-            uint32_t offset = candidates[matches[i]].offset;
-            if (offset == candidates[matches[i - 1]].offset ||
-                offset == candidates[matches[i - 2]].offset ||
-                offset == candidates[matches[i - 3]].offset)
+            uint32_t offset = cctx.candidates[cctx.matches[i]].offset;
+            if (offset == cctx.candidates[cctx.matches[i - 1]].offset ||
+                offset == cctx.candidates[cctx.matches[i - 2]].offset ||
+                offset == cctx.candidates[cctx.matches[i - 3]].offset)
             {
                 repeat++;
             }
@@ -1240,16 +1248,17 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             flag = flag | LZ3_compress_flag::OffsetRepeat;
         }
         vector<uint32_t> hist;
-        for (const auto& i : offsets)
+        cctx.hist = &hist;
+        for (const auto& i : cctx.offsets)
         {
             if (i.second > 0)
             {
                 hist.push_back(i.first);
             }
         }
-        stable_sort(hist.begin(), hist.end(), [&offsets](uint32_t x, uint32_t y)
+        stable_sort(hist.begin(), hist.end(), [&cctx](uint32_t x, uint32_t y)
         {
-            return offsets[x] != offsets[y] ? offsets[x] > offsets[y] : x < y;
+            return cctx.offsets[x] != cctx.offsets[y] ? cctx.offsets[x] > cctx.offsets[y] : x < y;
         });
         cctx.blockLog = 0;
         uint32_t blockBest = 0;
@@ -1261,7 +1270,7 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             {
                 if (offset % (1 << i) == 0)
                 {
-                    count += offsets[offset];
+                    count += cctx.offsets[offset];
                 }
             }
             if (count > blockPrev * block_step_tolerance)
@@ -1307,7 +1316,7 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
                 }
                 if (x < sta || x >= end)
                 {
-                    count += offsets[offset];
+                    count += cctx.offsets[offset];
                 }
             }
             if (count > total * dim_2_mode_threshold && count * dim_2_step_tolerance > lineBest)
@@ -1337,9 +1346,9 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
         vector<pair<uint32_t, uint8_t>> ext;
         cctx.ext = &ext;
         fill_n(cctx.preOff, 3, 0);
-        for (uint32_t index : matches)
+        for (uint32_t index : cctx.matches)
         {
-            const LZ3_match_info& match = candidates[index];
+            const LZ3_match_iter& match = cctx.candidates[index];
             uint32_t position = match.position - hisSize;
             if (position < srcPos)
             {
