@@ -44,7 +44,7 @@ using namespace std;
 * | offset mode | offset value | match length | literal length |
 */
 
-static constexpr uint32_t max_block_size = 0x8000;
+#define LZ3_MAX_ARRAY_SIZE (LZ3_MAX_BLOCK_SIZE + LZ3_DISTANCE_MAX)
 
 class LZ3_suffix_array
 {
@@ -55,8 +55,8 @@ public:
     {
         n = l;
         sa = &buffer[0];
-        rk = &buffer[max_block_size * 2];
-        height = &buffer[max_block_size * 8];
+        rk = &buffer[LZ3_MAX_ARRAY_SIZE];
+        height = &buffer[LZ3_MAX_ARRAY_SIZE * 4];
     }
 
     uint32_t* sa;
@@ -70,10 +70,10 @@ public:
         assert(l == n);
 
         sa = &buffer[0];
-        rk = &buffer[max_block_size * 2];
-        uint32_t* sa_2nd = &buffer[max_block_size * 4];
-        uint32_t* rk_2nd = &buffer[max_block_size * 6];
-        uint32_t* bucket = &buffer[max_block_size * 8];
+        rk = &buffer[LZ3_MAX_ARRAY_SIZE];
+        uint32_t* sa_2nd = &buffer[LZ3_MAX_ARRAY_SIZE * 2];
+        uint32_t* rk_2nd = &buffer[LZ3_MAX_ARRAY_SIZE * 3];
+        uint32_t* bucket = &buffer[LZ3_MAX_ARRAY_SIZE * 4];
         uint32_t bucket_count = 256;
 
         //对第一个字符排序
@@ -126,7 +126,7 @@ public:
 
     void cal_height(const uint8_t* s, uint32_t l) {
         assert(l == n);
-        height = &buffer[max_block_size * 8];
+        height = &buffer[LZ3_MAX_ARRAY_SIZE * 4];
 
         uint32_t k = 0;
         for (uint32_t i = 0; i < l; ++i) {
@@ -157,7 +157,7 @@ public:
                 sa[c] = s - l;
                 rk[sa[c]] = c;
                 height[c] = h;
-                h = max_block_size * 2;
+                h = LZ3_MAX_ARRAY_SIZE;
                 ++c;
             }
         }
@@ -215,7 +215,7 @@ public:
     }
 
 private:
-    uint32_t buffer[max_block_size * 10];
+    uint32_t buffer[LZ3_MAX_ARRAY_SIZE * 5];
 
     static bool rank_both_equal(uint32_t* r, uint32_t a, uint32_t b, uint32_t l, uint32_t n) {
         if (r[a] != r[b]) return false;
@@ -251,7 +251,7 @@ public:
     uint32_t offset;
 
     LZ3_match_iter(const LZ3_suffix_array* psa, uint32_t position) :
-        position(position), length(max_block_size), offset(0)
+        position(position), length(LZ3_DISTANCE_MAX + 1), offset(0)
     {
         prev = psa->rk[position];
         next = psa->rk[position] + 1;
@@ -280,7 +280,7 @@ public:
             {
                 return false;
             }
-            if (position > index && position - index < max_block_size)
+            if (position > index && position - index <= LZ3_DISTANCE_MAX)
             {
                 offset = position - index;
                 return true;
@@ -405,40 +405,44 @@ LZ3_FORCE_INLINE static constexpr bool operator&(LZ3_compress_flag lhs, LZ3_comp
     return (static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs)) > 0;
 }
 
-static uint16_t ll_base[] = {
+#define LZ3_MAX_LL 35
+
+static uint16_t ll_base[LZ3_MAX_LL] = {
     0,        1,        2,        3,        4,        5,        6,        7,
     8,        9,        10,       11,       12,       13,       14,       15,
     16,       18,       20,       22,       24,       28,       32,       40,
     48,       64,       0x80,     0x100,    0x200,    0x400,    0x800,    0x1000,
-    0x2000,   0x4000
+    0x2000,   0x4000,   0x8000
 };
 
-static uint8_t ll_bits[] = {
+static uint8_t ll_bits[LZ3_MAX_LL] = {
     0,        0,        0,        0,        0,        0,        0,        0,
     0,        0,        0,        0,        0,        0,        0,        0,
     1,        1,        1,        1,        2,        2,        3,        3,
     4,        6,        7,        8,        9,        10,       11,       12,
-    13,       14
+    13,       14,       15
 };
 
-static uint16_t ml_base[] = {
+#define LZ3_MAX_ML 52
+
+static uint16_t ml_base[LZ3_MAX_ML] = {
     3,        4,        5,        6,        7,        8,        9,        10,
     11,       12,       13,       14,       15,       16,       17,       18,
     19,       20,       21,       22,       23,       24,       25,       26,
     27,       28,       29,       30,       31,       32,       33,       34,
     35,       37,       39,       41,       43,       47,       51,       59,
     67,       83,       99,       0x83,     0x103,    0x203,    0x403,    0x803,
-    0x1003,   0x2003,   0x4003
+    0x1003,   0x2003,   0x4003,   0x8003
 };
 
-static uint8_t ml_bits[] = {
+static uint8_t ml_bits[LZ3_MAX_ML] = {
     0,        0,        0,        0,        0,        0,        0,        0,
     0,        0,        0,        0,        0,        0,        0,        0,
     0,        0,        0,        0,        0,        0,        0,        0,
     0,        0,        0,        0,        0,        0,        0,        0,
     1,        1,        1,        1,        2,        2,        3,        3,
     4,        4,        5,        7,        8,        9,       10,        11,
-    12,       13,       14
+    12,       13,       14,       15
 };
 
 /* of_base and of_bits will be generated based on compress flags
@@ -1364,7 +1368,7 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             }
             else
             {
-                LZ3_encode_seq(lls, ext, ll_base, ll_bits, 16, 34, literal);
+                LZ3_encode_seq(lls, ext, ll_base, ll_bits, 16, LZ3_MAX_LL, literal);
             }
             srcPos += literal;
             LZ3_encode_off_wrapper(ofs, cctx, offset, flag);
@@ -1374,7 +1378,7 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             }
             else
             {
-                LZ3_encode_seq(mls, ext, ml_base, ml_bits, 32, 51, length);
+                LZ3_encode_seq(mls, ext, ml_base, ml_bits, 32, LZ3_MAX_ML, length);
             }
             srcPos += length;
         }
@@ -1387,7 +1391,7 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
             }
             else
             {
-                LZ3_encode_seq(lls, ext, ll_base, ll_bits, 16, 34, literal);
+                LZ3_encode_seq(lls, ext, ll_base, ll_bits, 16, LZ3_MAX_LL, literal);
             }
             copy(&src[srcPos], &src[srcSize], back_inserter(lit));
         }
@@ -1396,7 +1400,7 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
         LZ3_write_stream(dstPtr, ofs.data(), (uint32_t)ofs.size(), coder);
         LZ3_write_stream(dstPtr, mls.data(), (uint32_t)mls.size(), coder);
         BIT_CStream_t bitStr;
-        BIT_initCStream(&bitStr, dstPtr + sizeof(uint16_t), ext.size() * 2 + sizeof(size_t));
+        BIT_initCStream(&bitStr, dstPtr + sizeof(uint16_t), ext.size() * 2/*15bit*/ + 1 + sizeof(size_t));
         for (size_t i = ext.size(); i > 0; --i)
         {
             const pair<uint32_t, uint8_t>& bits = ext[i - 1];
@@ -1700,7 +1704,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
 uint32_t LZ3_compress(const void* src, void* dst, uint32_t srcSize)
 {
     uint32_t dstPos;
-    if (srcSize <= max_block_size)
+    if (srcSize <= LZ3_MAX_BLOCK_SIZE)
     {
         LZ3_suffix_array* psa = new LZ3_suffix_array(srcSize);
         psa->cal_suffix_array((const uint8_t*)src, srcSize);
@@ -1726,7 +1730,7 @@ uint32_t LZ3_compress(const void* src, void* dst, uint32_t srcSize)
 uint32_t LZ3_decompress_fast(const void* src, void* dst, uint32_t dstSize)
 {
     uint32_t srcPos;
-    if (dstSize < max_block_size)
+    if (dstSize < LZ3_MAX_BLOCK_SIZE)
     {
         srcPos = (uint32_t)LZ3_decompress_generic<LZ3_entropy_coder::None>((const uint8_t*)src, (uint8_t*)dst, dstSize);
     }
@@ -1742,7 +1746,7 @@ uint32_t LZ3_decompress_fast(const void* src, void* dst, uint32_t dstSize)
 uint32_t LZ3_compress_HUF(const void* src, void* dst, uint32_t srcSize)
 {
     uint32_t dstPos;
-    if (srcSize <= max_block_size)
+    if (srcSize <= LZ3_MAX_BLOCK_SIZE)
     {
         LZ3_suffix_array* psa = new LZ3_suffix_array(srcSize);
         psa->cal_suffix_array((const uint8_t*)src, srcSize);
@@ -1768,7 +1772,7 @@ uint32_t LZ3_compress_HUF(const void* src, void* dst, uint32_t srcSize)
 uint32_t LZ3_decompress_HUF_fast(const void* src, void* dst, uint32_t dstSize)
 {
     uint32_t srcPos;
-    if (dstSize < max_block_size)
+    if (dstSize < LZ3_MAX_BLOCK_SIZE)
     {
         srcPos = (uint32_t)LZ3_decompress_generic<LZ3_entropy_coder::Huff0>((const uint8_t*)src, (uint8_t*)dst, dstSize);
     }
@@ -1785,7 +1789,7 @@ struct LZ3_CStream
 {
     LZ3_suffix_array hsa;
     LZ3_suffix_array tsa;
-    uint8_t sz[max_block_size * 2];
+    uint8_t sz[LZ3_MAX_ARRAY_SIZE];
     uint8_t* psz;
 
     LZ3_CStream()
@@ -1802,13 +1806,13 @@ uint32_t LZ3_compress_continue_generic(LZ3_CStream* pcs, const void* src, void* 
     pcs->tsa.cal_height((const uint8_t*)src, srcSize);
     if (pcs->psz + srcSize > pcs->sz + sizeof(pcs->sz))
     {
-        memcpy(pcs->sz, pcs->psz - max_block_size, max_block_size);
-        pcs->psz = pcs->sz + max_block_size;
+        memcpy(pcs->sz, pcs->psz - LZ3_DISTANCE_MAX, LZ3_DISTANCE_MAX);
+        pcs->psz = pcs->sz + LZ3_DISTANCE_MAX;
     }
     memcpy(pcs->psz, src, srcSize);
-    if (pcs->hsa.n> max_block_size)
+    if (pcs->hsa.n > LZ3_DISTANCE_MAX)
     {
-        pcs->hsa.popn_suffix(pcs->hsa.n - max_block_size);
+        pcs->hsa.popn_suffix(pcs->hsa.n - LZ3_DISTANCE_MAX);
     }
     pcs->hsa.push_suffix(pcs->psz - pcs->hsa.n, &pcs->tsa);
     size_t dstPos = LZ3_compress_generic<coder>(&pcs->hsa, pcs->psz, (uint8_t*)dst, srcSize);
@@ -1818,7 +1822,7 @@ uint32_t LZ3_compress_continue_generic(LZ3_CStream* pcs, const void* src, void* 
 
 struct LZ3_DStream
 {
-    uint8_t sz[max_block_size * 2];
+    uint8_t sz[LZ3_MAX_ARRAY_SIZE];
     uint8_t* psz;
 
     LZ3_DStream()
@@ -1832,8 +1836,8 @@ uint32_t LZ3_decompress_continue_generic(LZ3_DStream* pds, const void* src, void
 {
     if (pds->psz + dstSize > pds->sz + sizeof(pds->sz))
     {
-        memcpy(pds->sz, pds->psz - max_block_size, max_block_size);
-        pds->psz = pds->sz + max_block_size;
+        memcpy(pds->sz, pds->psz - LZ3_DISTANCE_MAX, LZ3_DISTANCE_MAX);
+        pds->psz = pds->sz + LZ3_DISTANCE_MAX;
     }
     size_t srcPos = LZ3_decompress_generic<coder>((const uint8_t*)src, pds->psz, dstSize);
     memcpy(dst, pds->psz, dstSize);
@@ -1868,7 +1872,7 @@ uint32_t LZ3_compress_continue(LZ3_CStream* pcs, const void* src, void* dst, uin
     uint8_t* dstPtr = (uint8_t*)dst;
     while (srcPtr < srcEnd)
     {
-        size_t curSize = min<size_t>(srcEnd - srcPtr, max_block_size);
+        size_t curSize = min<size_t>(srcEnd - srcPtr, LZ3_MAX_BLOCK_SIZE);
         dstPtr += LZ3_compress_continue_generic<LZ3_entropy_coder::None>(pcs, srcPtr, dstPtr, (uint32_t)curSize);
         srcPtr += curSize;
     }
@@ -1882,7 +1886,7 @@ uint32_t LZ3_decompress_continue(LZ3_DStream* pds, const void* src, void* dst, u
     uint8_t* dstEnd = dstPtr + dstSize;
     while (dstPtr < dstEnd)
     {
-        size_t curSize = min<size_t>(dstEnd - dstPtr, max_block_size);
+        size_t curSize = min<size_t>(dstEnd - dstPtr, LZ3_MAX_BLOCK_SIZE);
         srcPtr += LZ3_decompress_continue_generic<LZ3_entropy_coder::None>(pds, srcPtr, dstPtr, (uint32_t)curSize);
         dstPtr += curSize;
     }
@@ -1896,7 +1900,7 @@ uint32_t LZ3_compress_HUF_continue(LZ3_CStream* pcs, const void* src, void* dst,
     uint8_t* dstPtr = (uint8_t*)dst;
     while (srcPtr < srcEnd)
     {
-        size_t curSize = min<size_t>(srcEnd - srcPtr, max_block_size);
+        size_t curSize = min<size_t>(srcEnd - srcPtr, LZ3_MAX_BLOCK_SIZE);
         dstPtr += LZ3_compress_continue_generic<LZ3_entropy_coder::Huff0>(pcs, srcPtr, dstPtr, (uint32_t)curSize);
         srcPtr += curSize;
     }
@@ -1910,7 +1914,7 @@ uint32_t LZ3_decompress_HUF_continue(LZ3_DStream* pds, const void* src, void* ds
     uint8_t* dstEnd = dstPtr + dstSize;
     while (dstPtr < dstEnd)
     {
-        size_t curSize = min<size_t>(dstEnd - dstPtr, max_block_size);
+        size_t curSize = min<size_t>(dstEnd - dstPtr, LZ3_MAX_BLOCK_SIZE);
         srcPtr += LZ3_decompress_continue_generic<LZ3_entropy_coder::Huff0>(pds, srcPtr, dstPtr, (uint32_t)curSize);
         dstPtr += curSize;
     }
