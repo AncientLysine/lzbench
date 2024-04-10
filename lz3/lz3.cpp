@@ -390,6 +390,12 @@ enum class LZ3_compress_flag : uint8_t
     OffsetTwoDim = 4,
 };
 
+enum class LZ3_history_pos
+{
+    Prefix,
+    Extern,
+};
+
 LZ3_FORCE_INLINE static constexpr LZ3_compress_flag operator|(LZ3_compress_flag lhs, LZ3_compress_flag rhs) 
 {
     return static_cast<LZ3_compress_flag>(static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
@@ -1414,10 +1420,80 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
     }
 }
 
-static constexpr uint32_t wild_cpy_length = 16;
+template<size_t length>
+LZ3_FORCE_INLINE static void LZ3_wild_copy(uint8_t* dst, uint8_t* dstEnd, const uint8_t* src)
+{
+    do
+    {
+        memcpy(dst, src, length);
+        dst += length;
+        src += length;
+    }
+    while (dst < dstEnd);
+}
 
-template<LZ3_entropy_coder coder>
-static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t dstSize)
+template<size_t length>
+static void LZ3_safe_copy(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, const uint8_t* src)
+{
+    if (dstEnd <= dstShortEnd)
+    {
+        LZ3_wild_copy<length>(dst, dstEnd, src);
+        return;
+    }
+    if (dst < dstShortEnd)
+    {
+        LZ3_wild_copy<length>(dst, dstShortEnd, src);
+        src += dstShortEnd - dst;
+        dst += dstShortEnd - dst;
+    }
+    while (dst < dstEnd)
+    {
+        *dst++ = *src++;
+    }
+}
+
+template<size_t length>
+static void LZ3_safe_move(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, const uint8_t* src)
+{
+    if (dst + 8 > dstEnd)
+    {
+        while (dst < dstEnd)
+        {
+            *dst++ = *src++;
+        }
+        return;
+    }
+    ptrdiff_t offset = dst - src;
+    if (offset >= 8)
+    {
+        memcpy(dst, src, 8);
+    }
+    else
+    {
+        static constexpr ptrdiff_t dec32table[] = { 0, 1, 2, 1, 4, 4, 4, 4 };   /* added */
+        static constexpr ptrdiff_t dec64table[] = { 8, 8, 8, 7, 8, 9,10,11 };   /* subtracted */
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+        src += dec32table[offset];
+        memcpy(dst + 4, src, 4);
+        src -= dec64table[offset];
+    }
+    dst += 8;
+    src += 8;
+    if (length > 8u && offset < length)
+    {
+        LZ3_safe_copy<8u>(dst, dstEnd, dstShortEnd, src);
+        return;
+    }
+    LZ3_safe_copy<length>(dst, dstEnd, dstShortEnd, src);
+}
+
+static constexpr uint32_t wild_copy_length = 16;
+
+template<LZ3_entropy_coder coder, LZ3_history_pos hisPos>
+static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t dstSize, size_t preSize, const uint8_t* ext, size_t extSize)
 {
 #if defined(LZ3_LOG) && !defined(NDEBUG)
     ofstream dfs("LZ3_decompress.log");
@@ -1425,7 +1501,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     const uint8_t* srcPtr = src;
     uint8_t* dstPtr = dst;
     uint8_t* dstEnd = dstPtr + dstSize;
-    uint8_t* dstShortEnd = dstSize > wild_cpy_length ? dstEnd - wild_cpy_length : dstPtr;
+    uint8_t* dstShortEnd = dstEnd - wild_copy_length;
 
     LZ3_DCtx dctx;
     LZ3_compress_flag flag = LZ3_compress_flag::None;
@@ -1487,7 +1563,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         {
             literal = *llsPtr++;
         }
-        if (LZ3_LIKELY(literal <= min(wild_cpy_length, coder == LZ3_entropy_coder::None ? 0xEu : 0xFu)))
+        if (LZ3_LIKELY(literal <= min(wild_copy_length, coder == LZ3_entropy_coder::None ? 0xEu : 0xFu)))
         {
             if (LZ3_UNLIKELY(dstPtr >= dstShortEnd))
             {
@@ -1503,9 +1579,8 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             {
                 refPtr = litPtr;
             }
-            //TODO by Lysine: copy literal may read beyond stream end
-            memcpy(cpyPtr + 0, refPtr + 0, 8);
-            memcpy(cpyPtr + 8, refPtr + 8, 8);
+            //TODO by Lysine: copy literal may read beyond source/stream end
+            memcpy(cpyPtr, refPtr, wild_copy_length);
             dstPtr += literal;
             if (coder == LZ3_entropy_coder::None)
             {
@@ -1546,23 +1621,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             {
                 refPtr = litPtr;
             }
-            if (LZ3_UNLIKELY(cpyEnd > dstShortEnd))
-            {
-                while (cpyPtr < cpyEnd)
-                {
-                    *cpyPtr++ = *refPtr++;
-                }
-            }
-            else
-            {
-                while (cpyPtr < cpyEnd)
-                {
-                    memcpy(cpyPtr + 0, refPtr + 0, 8);
-                    memcpy(cpyPtr + 8, refPtr + 8, 8);
-                    cpyPtr += wild_cpy_length;
-                    refPtr += wild_cpy_length;
-                }
-            }
+            LZ3_safe_copy<wild_copy_length>(cpyPtr, cpyEnd, dstShortEnd, refPtr);
             dstPtr += literal;
             if (coder == LZ3_entropy_coder::None)
             {
@@ -1589,17 +1648,21 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             ofsPtr += result.seqLen;
             length = *mlsPtr++;
         }
-        if (LZ3_LIKELY(length <= min(wild_cpy_length - min_match_length, coder == LZ3_entropy_coder::None ? 0xEu : 0x1Fu)))
+        if (LZ3_LIKELY(length <= min(wild_copy_length - min_match_length, coder == LZ3_entropy_coder::None ? 0xEu : 0x1Fu)))
         {
             length += min_match_length;
             if (LZ3_UNLIKELY(dstPtr >= dstShortEnd || offset < 8))
             {
                 goto safe_copy_match;
             }
-            uint8_t* cpyPtr = dstPtr;
             const uint8_t* refPtr = dstPtr - offset;
-            memcpy(cpyPtr + 0, refPtr + 0, 8);
-            memcpy(cpyPtr + 8, refPtr + 8, 8);
+            const uint8_t* prePtr = dst - preSize;
+            if (hisPos == LZ3_history_pos::Extern && refPtr < prePtr)
+            {
+                goto safe_copy_match;
+            }
+            memcpy(dstPtr + 0, refPtr + 0, 8);
+            memcpy(dstPtr + 8, refPtr + 8, wild_copy_length - 8);
 #if defined(LZ3_LOG) && !defined(NDEBUG)
             dfs << dstPtr - dst << ": " << length << " " << offset << endl;
 #endif
@@ -1627,58 +1690,33 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             uint8_t* cpyPtr = dstPtr;
             uint8_t* cpyEnd = dstPtr + length;
             assert(cpyEnd <= dstEnd);
-            const uint8_t* refPtr = cpyPtr - offset;
-            if (LZ3_UNLIKELY(cpyEnd > dstShortEnd)/*dstEnd - (wild_cpy_length - 1)*/)
+            const uint8_t* refPtr = dstPtr - offset;
+            const uint8_t* prePtr = dst - preSize;
+            if (hisPos == LZ3_history_pos::Extern && refPtr < prePtr)
             {
-                do
+                ptrdiff_t extLen = prePtr - refPtr;
+                const uint8_t* extEnd = ext + extSize;
+                const uint8_t* extPtr = extEnd - extLen;
+                if (length <= extLen)
                 {
-                    *cpyPtr++ = *refPtr++;
+                    //full in ext
+                    refPtr = extPtr;
                 }
-                while (cpyPtr < cpyEnd);
-            }
-            else if (offset >= 8)
-            {
-                do
+                else
                 {
-                    memcpy(cpyPtr + 0, refPtr + 0, 8);
-                    memcpy(cpyPtr + 8, refPtr + 8, 8);
-                    cpyPtr += wild_cpy_length;
-                    refPtr += wild_cpy_length;
+                    //both in ext and pre, copy ext here.
+                    refPtr = prePtr;
+                    do
+                    {
+                        *cpyPtr++ = *extPtr++;
+                    }
+                    while (extPtr < extEnd);
                 }
-                while (cpyPtr < cpyEnd);
-            }
-            else if (offset == 1 || offset == 2 || offset == 4)
-            {
-                uint8_t buffer[8] = { 0 };
-                switch (offset)
-                {
-                case 1:
-                    memset(buffer, *refPtr, 8);
-                    break;
-                case 2:
-                    memcpy(buffer, refPtr, 2);
-                    memcpy(buffer + 2, refPtr, 2);
-                    memcpy(buffer + 4, buffer, 4);
-                    break;
-                case 4:
-                    memcpy(buffer, refPtr, 4);
-                    memcpy(buffer + 4, refPtr, 4);
-                    break;
-                }
-                do
-                {
-                    memcpy(cpyPtr, buffer, 8);
-                    cpyPtr += 8;
-                }
-                while (cpyPtr < cpyEnd);
+                LZ3_safe_copy<wild_copy_length>(cpyPtr, cpyEnd, dstShortEnd, refPtr);
             }
             else
             {
-                do
-                {
-                    *cpyPtr++ = *refPtr++;
-                }
-                while (cpyPtr < cpyEnd);
+                LZ3_safe_move<wild_copy_length>(cpyPtr, cpyEnd, dstShortEnd, refPtr);
             }
 #if defined(LZ3_LOG) && !defined(NDEBUG)
             dfs << dstPtr - dst << ": " << length << " " << offset << endl;
@@ -1732,12 +1770,12 @@ uint32_t LZ3_decompress_fast(const void* src, void* dst, uint32_t dstSize)
     uint32_t srcPos;
     if (dstSize < LZ3_MAX_BLOCK_SIZE)
     {
-        srcPos = (uint32_t)LZ3_decompress_generic<LZ3_entropy_coder::None>((const uint8_t*)src, (uint8_t*)dst, dstSize);
+        srcPos = (uint32_t)LZ3_decompress_generic<LZ3_entropy_coder::None, LZ3_history_pos::Prefix>((const uint8_t*)src, (uint8_t*)dst, dstSize, 0, nullptr, 0);
     }
     else
     {
         LZ3_DStream* pds = LZ3_createDStream();
-        srcPos = LZ3_decompress_continue(pds, src, dst, dstSize);
+        srcPos = LZ3_decompress_fast_continue(pds, src, dst, dstSize);
         LZ3_freeDStream(pds);
     }
     return srcPos;
@@ -1774,12 +1812,12 @@ uint32_t LZ3_decompress_HUF_fast(const void* src, void* dst, uint32_t dstSize)
     uint32_t srcPos;
     if (dstSize < LZ3_MAX_BLOCK_SIZE)
     {
-        srcPos = (uint32_t)LZ3_decompress_generic<LZ3_entropy_coder::Huff0>((const uint8_t*)src, (uint8_t*)dst, dstSize);
+        srcPos = (uint32_t)LZ3_decompress_generic<LZ3_entropy_coder::Huff0, LZ3_history_pos::Prefix>((const uint8_t*)src, (uint8_t*)dst, dstSize, 0, nullptr, 0);
     }
     else
     {
         LZ3_DStream* pds = LZ3_createDStream();
-        srcPos = LZ3_decompress_HUF_continue(pds, src, dst, dstSize);
+        srcPos = LZ3_decompress_HUF_fast_continue(pds, src, dst, dstSize);
         LZ3_freeDStream(pds);
     }
     return srcPos;
@@ -1789,8 +1827,8 @@ struct LZ3_CStream
 {
     LZ3_suffix_array hsa;
     LZ3_suffix_array tsa;
-    uint8_t sz[LZ3_MAX_ARRAY_SIZE];
     uint8_t* psz;
+    uint8_t sz[LZ3_MAX_ARRAY_SIZE];
 
     LZ3_CStream()
     {
@@ -1801,32 +1839,48 @@ struct LZ3_CStream
 template<LZ3_entropy_coder coder>
 uint32_t LZ3_compress_continue_generic(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize)
 {
-    pcs->tsa.n = srcSize;
-    pcs->tsa.cal_suffix_array((const uint8_t*)src, srcSize);
-    pcs->tsa.cal_height((const uint8_t*)src, srcSize);
-    if (pcs->psz + srcSize > pcs->sz + sizeof(pcs->sz))
+    const uint8_t* srcPtr = (const uint8_t*)src;
+    const uint8_t* srcEnd = srcPtr + srcSize;
+    uint8_t* dstPtr = (uint8_t*)dst;
+    while (srcPtr < srcEnd)
     {
-        memcpy(pcs->sz, pcs->psz - LZ3_DISTANCE_MAX, LZ3_DISTANCE_MAX);
-        pcs->psz = pcs->sz + LZ3_DISTANCE_MAX;
+        uint32_t curSize = min((uint32_t)(srcEnd - srcPtr), LZ3_MAX_BLOCK_SIZE);
+        pcs->tsa.n = curSize;
+        pcs->tsa.cal_suffix_array(srcPtr, curSize);
+        pcs->tsa.cal_height(srcPtr, curSize);
+        if (pcs->psz + curSize > pcs->sz + sizeof(pcs->sz))
+        {
+            memcpy(pcs->sz, pcs->psz - LZ3_DISTANCE_MAX, LZ3_DISTANCE_MAX);
+            pcs->psz = pcs->sz + LZ3_DISTANCE_MAX;
+        }
+        memcpy(pcs->psz, srcPtr, curSize);
+        srcPtr += curSize;
+        if (pcs->hsa.n > LZ3_DISTANCE_MAX)
+        {
+            pcs->hsa.popn_suffix(pcs->hsa.n - LZ3_DISTANCE_MAX);
+        }
+        pcs->hsa.push_suffix(pcs->psz - pcs->hsa.n, &pcs->tsa);
+        dstPtr += LZ3_compress_generic<coder>(&pcs->hsa, pcs->psz, dstPtr, curSize);
+        pcs->psz += curSize;
     }
-    memcpy(pcs->psz, src, srcSize);
-    if (pcs->hsa.n > LZ3_DISTANCE_MAX)
-    {
-        pcs->hsa.popn_suffix(pcs->hsa.n - LZ3_DISTANCE_MAX);
-    }
-    pcs->hsa.push_suffix(pcs->psz - pcs->hsa.n, &pcs->tsa);
-    size_t dstPos = LZ3_compress_generic<coder>(&pcs->hsa, pcs->psz, (uint8_t*)dst, srcSize);
-    pcs->psz += srcSize;
-    return (uint32_t)dstPos;
+    return (uint32_t)(dstPtr - (uint8_t*)dst);
 }
 
 struct LZ3_DStream
 {
-    uint8_t sz[LZ3_MAX_ARRAY_SIZE];
+    uint8_t* preEnd;
+    size_t preSize;
+    uint8_t* extPtr;
+    size_t extSize;
     uint8_t* psz;
+    uint8_t sz[LZ3_MAX_ARRAY_SIZE];
 
     LZ3_DStream()
     {
+        preEnd = nullptr;
+        preSize = 0;
+        extPtr = nullptr;
+        extSize = 0;
         psz = sz;
     };
 };
@@ -1834,15 +1888,62 @@ struct LZ3_DStream
 template<LZ3_entropy_coder coder>
 uint32_t LZ3_decompress_continue_generic(LZ3_DStream* pds, const void* src, void* dst, uint32_t dstSize)
 {
-    if (pds->psz + dstSize > pds->sz + sizeof(pds->sz))
+    const uint8_t* srcPtr = (const uint8_t*)src;
+    uint8_t* dstPtr = (uint8_t*)dst;
+    uint8_t* dstEnd = dstPtr + dstSize;
+    while (dstPtr < dstEnd)
     {
-        memcpy(pds->sz, pds->psz - LZ3_DISTANCE_MAX, LZ3_DISTANCE_MAX);
-        pds->psz = pds->sz + LZ3_DISTANCE_MAX;
+        uint32_t curSize = min((uint32_t)(dstEnd - dstPtr), LZ3_MAX_BLOCK_SIZE);
+        if (pds->psz + curSize > pds->sz + sizeof(pds->sz))
+        {
+            memcpy(pds->sz, pds->psz - LZ3_DISTANCE_MAX, LZ3_DISTANCE_MAX);
+            pds->psz = pds->sz + LZ3_DISTANCE_MAX;
+        }
+        srcPtr += LZ3_decompress_generic<coder, LZ3_history_pos::Prefix>(srcPtr, pds->psz, curSize, 0, nullptr, 0);
+        memcpy(dstPtr, pds->psz, curSize);
+        dstPtr += curSize;
+        pds->psz += curSize;
     }
-    size_t srcPos = LZ3_decompress_generic<coder>((const uint8_t*)src, pds->psz, dstSize);
-    memcpy(dst, pds->psz, dstSize);
-    pds->psz += dstSize;
-    return (uint32_t)srcPos;
+    return (uint32_t)(srcPtr - (const uint8_t*)src);
+}
+
+template<LZ3_entropy_coder coder>
+uint32_t LZ3_decompress_fast_continue_generic(LZ3_DStream* pds, const void* src, void* dst, uint32_t dstSize)
+{
+    const uint8_t* srcPtr = (const uint8_t*)src;
+    uint8_t* dstPtr = (uint8_t*)dst;
+    uint8_t* dstEnd = dstPtr + dstSize;
+    while (dstPtr < dstEnd)
+    {
+        size_t curSize = min<size_t>(dstEnd - dstPtr, LZ3_MAX_BLOCK_SIZE);
+        if (pds->preSize == 0)
+        {
+            //0. Dst
+            srcPtr += LZ3_decompress_generic<coder, LZ3_history_pos::Prefix>(srcPtr, dstPtr, curSize, 0, nullptr, 0);
+        }
+        else if (dstPtr != pds->preEnd)
+        {
+            //2. Dst------------Ext
+            pds->extPtr = pds->preEnd - pds->preSize;
+            pds->extSize = pds->preSize;
+            pds->preSize = 0;
+            srcPtr += LZ3_decompress_generic<coder, LZ3_history_pos::Extern>(srcPtr, dstPtr, curSize, 0, pds->extPtr, pds->extSize);
+        }
+        else if (pds->preSize >= LZ3_DISTANCE_MAX || pds->extSize == 0)
+        {
+            //1. -----------Pre-Dst
+            srcPtr += LZ3_decompress_generic<coder, LZ3_history_pos::Prefix>(srcPtr, dstPtr, curSize, pds->preSize, nullptr, 0);
+        }
+        else
+        {
+            //3. Pre-Dst--------Ext
+            srcPtr += LZ3_decompress_generic<coder, LZ3_history_pos::Extern>(srcPtr, dstPtr, curSize, pds->preSize, pds->extPtr, pds->extSize);
+        }
+        dstPtr += curSize;
+        pds->preEnd = dstPtr;
+        pds->preSize += curSize;
+    }
+    return (uint32_t)(srcPtr - (const uint8_t*)src);
 }
 
 LZ3_CStream* LZ3_createCStream()
@@ -1867,56 +1968,30 @@ void LZ3_freeDStream(LZ3_DStream* pds)
 
 uint32_t LZ3_compress_continue(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize)
 {
-    const uint8_t* srcPtr = (const uint8_t*)src;
-    const uint8_t* srcEnd = srcPtr + srcSize;
-    uint8_t* dstPtr = (uint8_t*)dst;
-    while (srcPtr < srcEnd)
-    {
-        size_t curSize = min<size_t>(srcEnd - srcPtr, LZ3_MAX_BLOCK_SIZE);
-        dstPtr += LZ3_compress_continue_generic<LZ3_entropy_coder::None>(pcs, srcPtr, dstPtr, (uint32_t)curSize);
-        srcPtr += curSize;
-    }
-    return (uint32_t)(dstPtr - (uint8_t*)dst);
+    return LZ3_compress_continue_generic<LZ3_entropy_coder::None>(pcs, src, dst, srcSize);
 }
 
 uint32_t LZ3_decompress_continue(LZ3_DStream* pds, const void* src, void* dst, uint32_t dstSize)
 {
-    const uint8_t* srcPtr = (const uint8_t*)src;
-    uint8_t* dstPtr = (uint8_t*)dst;
-    uint8_t* dstEnd = dstPtr + dstSize;
-    while (dstPtr < dstEnd)
-    {
-        size_t curSize = min<size_t>(dstEnd - dstPtr, LZ3_MAX_BLOCK_SIZE);
-        srcPtr += LZ3_decompress_continue_generic<LZ3_entropy_coder::None>(pds, srcPtr, dstPtr, (uint32_t)curSize);
-        dstPtr += curSize;
-    }
-    return (uint32_t)(srcPtr - (const uint8_t*)src);
+    return LZ3_decompress_continue_generic<LZ3_entropy_coder::None>(pds, src, dst, dstSize);
+}
+
+uint32_t LZ3_decompress_fast_continue(LZ3_DStream* pds, const void* src, void* dst, uint32_t dstSize)
+{
+    return LZ3_decompress_fast_continue_generic<LZ3_entropy_coder::None>(pds, src, dst, dstSize);
 }
 
 uint32_t LZ3_compress_HUF_continue(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize)
 {
-    const uint8_t* srcPtr = (const uint8_t*)src;
-    const uint8_t* srcEnd = srcPtr + srcSize;
-    uint8_t* dstPtr = (uint8_t*)dst;
-    while (srcPtr < srcEnd)
-    {
-        size_t curSize = min<size_t>(srcEnd - srcPtr, LZ3_MAX_BLOCK_SIZE);
-        dstPtr += LZ3_compress_continue_generic<LZ3_entropy_coder::Huff0>(pcs, srcPtr, dstPtr, (uint32_t)curSize);
-        srcPtr += curSize;
-    }
-    return (uint32_t)(dstPtr - (uint8_t*)dst);
+    return LZ3_compress_continue_generic<LZ3_entropy_coder::Huff0>(pcs, src, dst, srcSize);
 }
 
 uint32_t LZ3_decompress_HUF_continue(LZ3_DStream* pds, const void* src, void* dst, uint32_t dstSize)
 {
-    const uint8_t* srcPtr = (const uint8_t*)src;
-    uint8_t* dstPtr = (uint8_t*)dst;
-    uint8_t* dstEnd = dstPtr + dstSize;
-    while (dstPtr < dstEnd)
-    {
-        size_t curSize = min<size_t>(dstEnd - dstPtr, LZ3_MAX_BLOCK_SIZE);
-        srcPtr += LZ3_decompress_continue_generic<LZ3_entropy_coder::Huff0>(pds, srcPtr, dstPtr, (uint32_t)curSize);
-        dstPtr += curSize;
-    }
-    return (uint32_t)(srcPtr - (const uint8_t*)src);
+    return LZ3_decompress_continue_generic<LZ3_entropy_coder::Huff0>(pds, src, dst, dstSize);
+}
+
+uint32_t LZ3_decompress_HUF_fast_continue(LZ3_DStream* pds, const void* src, void* dst, uint32_t dstSize)
+{
+    return LZ3_decompress_fast_continue_generic<LZ3_entropy_coder::Huff0>(pds, src, dst, dstSize);
 }
