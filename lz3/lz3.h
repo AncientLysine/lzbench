@@ -32,9 +32,41 @@ extern "C" {
 
 #endif
 
-LZ3_API uint32_t LZ3_compress(const uint8_t * src, uint8_t * dst, uint32_t srcSize);
+#ifndef LZ3_MAX_BLOCK_SIZE
+#define LZ3_MAX_BLOCK_SIZE 0xFF81
+#endif 
 
-LZ3_API uint32_t LZ3_decompress_fast(const uint8_t* src, uint8_t* dst, uint32_t dstSize);
+#ifndef LZ3_DISTANCE_MAX
+#define LZ3_DISTANCE_MAX 0x7FFF
+#endif 
+
+LZ3_API uint32_t LZ3_compress(const void* src, void* dst, uint32_t srcSize);
+
+LZ3_API uint32_t LZ3_decompress_fast(const void* src, void* dst, uint32_t dstSize);
+
+LZ3_API uint32_t LZ3_compress_HUF(const void* src, void* dst, uint32_t srcSize);
+
+LZ3_API uint32_t LZ3_decompress_HUF_fast(const void* src, void* dst, uint32_t dstSize);
+
+typedef struct LZ3_CStream LZ3_CStream;
+
+typedef struct LZ3_DStream LZ3_DStream;
+
+LZ3_CStream* LZ3_createCStream();
+
+LZ3_DStream* LZ3_createDStream();
+
+void LZ3_freeCStream(LZ3_CStream* pcs);
+
+void LZ3_freeDStream(LZ3_DStream* pds);
+
+uint32_t LZ3_compress_continue(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize);
+
+uint32_t LZ3_decompress_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
+
+uint32_t LZ3_compress_HUF_continue(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize);
+
+uint32_t LZ3_decompress_HUF_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
 
 #if defined (__cplusplus)
 }

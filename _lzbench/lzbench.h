@@ -137,7 +137,7 @@ typedef struct
 
 
 
-#define LZBENCH_COMPRESSOR_COUNT 74
+#define LZBENCH_COMPRESSOR_COUNT 75
 
 static const compressor_desc_t comp_desc[LZBENCH_COMPRESSOR_COUNT] =
 {
@@ -157,6 +157,7 @@ static const compressor_desc_t comp_desc[LZBENCH_COMPRESSOR_COUNT] =
     { "glza",       "0.8",         0,   0,    0,       0, lzbench_glza_compress,       lzbench_glza_decompress,       NULL,                    NULL },
     { "libdeflate", "1.9",         1,  12,    0,       0, lzbench_libdeflate_compress, lzbench_libdeflate_decompress, NULL,                    NULL },
     { "lz3",        "0.0",         0,   0,    0,       0, lzbench_lz3_compress,        lzbench_lz3_decompress,        NULL,                    NULL },
+    { "lz3huf",     "0.0",         0,   0,    0,       0, lzbench_lz3_compress_huf,    lzbench_lz3_decompress_huf,    NULL,                    NULL },
     { "lz4",        "1.9.3",       0,   0,    0,       0, lzbench_lz4_compress,        lzbench_lz4_decompress,        NULL,                    NULL },
     { "lz4fast",    "1.9.3",       1,  99,    0,       0, lzbench_lz4fast_compress,    lzbench_lz4_decompress,        NULL,                    NULL },
     { "lz4hc",      "1.9.3",       1,  12,    0,       0, lzbench_lz4hc_compress,      lzbench_lz4_decompress,        NULL,                    NULL },
