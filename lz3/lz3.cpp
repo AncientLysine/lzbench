@@ -564,9 +564,7 @@ static uint8_t of_bits_dim_x[] = {
 static constexpr float repeat_mode_threshold = 0.5f;
 static constexpr float block_step_tolerance = 0.98f;
 static constexpr float block_mode_threshold = 0.95f;
-static constexpr float dim_2_dist_tolerance = 0.12f;
-static constexpr float dim_2_mode_threshold = 0.5f;
-static constexpr float dim_2_step_tolerance = 0.5f;
+static constexpr float dim_2_mode_threshold = 0.9f;
 static constexpr float uncompress_threshold = 0.99f;
 static constexpr float uncompress_intercept = 0.0f;
 
@@ -1164,46 +1162,62 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
     }
     //ASTC may have NPOT line size
     cctx.lineSize = 0;
-    uint32_t lineBest = 0;
-    for (uint32_t i = 0; i < hist.size() && i < 16u; ++i)
+    uint32_t nonePrice = 0;
+    nonePrice += cctx.offsets.size() * 16u * LZ3_BIT_COST_MUL;
+    for (const auto& p : cctx.offsets)
+    {
+        uint32_t l = LZ3_weight(total) - LZ3_weight(p.second);
+        nonePrice += l * p.second;
+    }
+    for (uint32_t i = 0; i < hist.size() && i < 8u; ++i)
     {
         if (hist[i] % (1 << cctx.blockLog) != 0)
         {
             continue;
         }
-        uint32_t count = 0;
         uint32_t divisor = hist[i] >> cctx.blockLog;
-        uint32_t sta = min((uint32_t)(divisor * dim_2_dist_tolerance), 16u);
-        uint32_t end = divisor - sta;
-        for (uint32_t offset : hist)
+        uint32_t dim2Price = 0;
+        unordered_map<uint32_t, uint32_t> dim2;
+        for (const auto& p : cctx.offsets)
         {
-            if (offset % (1 << cctx.blockLog) != 0)
+            uint32_t o = p.first;
+            uint32_t count = p.second;
+            uint32_t r = o & ((1 << cctx.blockLog) - 1);
+            if (r != 0)
             {
-                continue;
+                dim2[divisor] += count;
+                dim2Price += cctx.blockLog * LZ3_BIT_COST_MUL;
+                o += (1 << cctx.blockLog) - r;
             }
-            uint32_t x = (offset >> cctx.blockLog) % divisor;
-            uint32_t y = (offset >> cctx.blockLog) / divisor;
+            o >>= cctx.blockLog;
+            o -= 1;
+            uint32_t x = o % divisor;
+            uint32_t y = o / divisor;
             if (y >= 64)
             {
-                count = 0;
+                dim2.clear();
                 break;
             }
-            if (y >= 32)
-            {
-                continue;
-            }
-            if (x < sta || x >= end)
-            {
-                count += cctx.offsets[offset];
-            }
+            dim2[x] += count;
+            dim2[y] += count;
         }
-        if (count > total * dim_2_mode_threshold && count * dim_2_step_tolerance > lineBest)
+        if (dim2.empty())
         {
-            lineBest = count;
+            continue;
+        }
+        dim2Price += dim2.size() * 8u * LZ3_BIT_COST_MUL;
+        for (const auto& p : dim2)
+        {
+            uint32_t l = LZ3_weight(total * 2) - LZ3_weight(p.second);
+            dim2Price += l * p.second;
+        }
+        if (dim2Price < nonePrice * dim_2_mode_threshold)
+        {
             cctx.lineSize = divisor;
+            break;
         }
     }
-    if (lineBest > 0)
+    if (cctx.lineSize != 0)
     {
         flag = flag | LZ3_compress_flag::OffsetBlock;
         flag = flag | LZ3_compress_flag::OffsetTwoDim;
@@ -1579,9 +1593,8 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
                 uint32_t r = o & ((1 << cctx.blockLog) - 1);
                 if (r != 0)
                 {
-                    r = (1 << cctx.blockLog) - r;
                     mOffHist.inc_stats(cctx.of_size, count);
-                    o += r;
+                    o += (1 << cctx.blockLog) - r;
                 }
                 o >>= cctx.blockLog;
             }
@@ -1615,9 +1628,8 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
                 uint32_t r = o & ((1 << cctx.blockLog) - 1);
                 if (r != 0)
                 {
-                    r = (1 << cctx.blockLog) - r;
                     bits += mOffHist.eval_bits(cctx.of_size) + cctx.blockLog * LZ3_BIT_COST_MUL;
-                    o += r;
+                    o += (1 << cctx.blockLog) - r;
                 }
                 o >>= cctx.blockLog;
             }
