@@ -1163,7 +1163,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
     //ASTC may have NPOT line size
     cctx.lineSize = 0;
     uint32_t nonePrice = 0;
-    nonePrice += cctx.offsets.size() * 16u * LZ3_BIT_COST_MUL;
+    nonePrice += (uint32_t)cctx.offsets.size() * 16u * LZ3_BIT_COST_MUL;
     for (const auto& p : cctx.offsets)
     {
         uint32_t l = LZ3_weight(total) - LZ3_weight(p.second);
@@ -1205,7 +1205,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
         {
             continue;
         }
-        dim2Price += dim2.size() * 8u * LZ3_BIT_COST_MUL;
+        dim2Price += (uint32_t)dim2.size() * 8u * LZ3_BIT_COST_MUL;
         for (const auto& p : dim2)
         {
             uint32_t l = LZ3_weight(total * 2) - LZ3_weight(p.second);
@@ -1225,6 +1225,8 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
     return flag;
 }
 
+static constexpr uint32_t sufficient_length = 256;
+
 template<
     typename LLenPrice, typename MLenPrice, typename MOffPrice, typename LRawPrice,
     typename LLenStats, typename MLenStats, typename MOffStats>
@@ -1243,8 +1245,17 @@ static vector<LZ3_match_info> LZ3_compress_opt(
         LZ3_match_iter match(psa, i + hisSize);
         if (match.match_next(psa, min_match_length))
         {
-            uint32_t lastPos = match.length;
             optimal.clear();
+            uint32_t lastPos = match.length;
+            LZ3_match_optm lastMatch;
+            if (match.length > sufficient_length)
+            {
+                lastMatch.position = match.position;
+                lastMatch.length = match.length;
+                lastMatch.offset = match.offset;
+                lastMatch.literal = match.position - srcPos;
+                goto sufficient_short_path;
+            }
             optimal.resize(lastPos + 1);
             {
                 /* initialize optimal[0] */
@@ -1293,30 +1304,38 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 {
                     /* Set prices using further matches found */
                     uint32_t lLen = optimal[j].length == 0 ? optimal[j].literal : 0;
-                    LZ3_match_iter matchFurther(psa, i + hisSize + j);
+                    LZ3_match_iter furtherMatch(psa, i + hisSize + j);
                     uint32_t mopBest = (uint32_t)-1;
-                    while (matchFurther.match_next(psa, min_match_length))
+                    while (furtherMatch.match_next(psa, min_match_length))
                     {
-                        if (j + matchFurther.length > lastPos)
+                        if (j + furtherMatch.length > lastPos)
                         {
-                            lastPos = j + matchFurther.length;
+                            lastPos = j + furtherMatch.length;
+                            if (furtherMatch.length > sufficient_length)
+                            {
+                                lastMatch.position = furtherMatch.position;
+                                lastMatch.offset = furtherMatch.offset;
+                                lastMatch.length = furtherMatch.length;
+                                lastMatch.literal = lLen;
+                                goto sufficient_short_path;
+                            }
                             optimal.resize(lastPos + 1);
                         }
-                        uint32_t mop = mOffPrice(matchFurther.offset);
+                        uint32_t mop = mOffPrice(furtherMatch.offset);
                         if (mop >= mopBest)
                         {
                             continue;
                         }
                         mopBest = mop;
-                        for (uint32_t k = matchFurther.length; k >= min_match_length; --k)
+                        for (uint32_t k = furtherMatch.length; k >= min_match_length; --k)
                         {
                             uint32_t mlp = mLenPrice(k);
                             uint32_t price = optimal[j].price + mlp + mop;
                             if (price < optimal[j + k].price)
                             {
-                                optimal[j + k].position = matchFurther.position;
+                                optimal[j + k].position = furtherMatch.position;
                                 optimal[j + k].length = k;
-                                optimal[j + k].offset = matchFurther.offset;
+                                optimal[j + k].offset = furtherMatch.offset;
                                 optimal[j + k].literal = lLen;
                                 optimal[j + k].price = price;
                             }
@@ -1324,19 +1343,22 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                     }
                 }
             }
+            lastMatch = optimal[lastPos];
+        sufficient_short_path:
             reverse.clear();
             for (uint32_t j = lastPos;;)
             {
-                if (optimal[j].length >= min_match_length)
+                if (lastMatch.length >= min_match_length)
                 {
-                    reverse.push_back(optimal[j]);
+                    reverse.push_back(lastMatch);
                 }
-                uint32_t back = optimal[j].literal + optimal[j].length;
+                uint32_t back = lastMatch.literal + lastMatch.length;
                 if (j <= back)
                 {
                     break;
                 }
                 j -= back;
+                lastMatch = optimal[j];
             }
             for (auto m = reverse.rbegin(); m != reverse.rend(); ++m)
             {
