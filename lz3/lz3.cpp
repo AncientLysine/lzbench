@@ -1276,9 +1276,14 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 {
                     /* Set prices using further matches found */
                     uint32_t lLen = optimal[j].length == 0 ? optimal[j].literal : 0;
-                    LZ3_match_iter furtherMatch(psa, i + hisSize + j);
                     uint32_t mopBest = (uint32_t)-1;
-                    while (furtherMatch.match_next(psa, min_match_length))
+                    uint32_t furtherLength = min_match_length;
+                    while (j + furtherLength <= lastPos && optimal[j].price >= optimal[j + furtherLength].price)
+                    {
+                        furtherLength++;
+                    }
+                    LZ3_match_iter furtherMatch(psa, i + hisSize + j);
+                    while (furtherMatch.match_next(psa, furtherLength))
                     {
                         if (j + furtherMatch.length > lastPos)
                         {
