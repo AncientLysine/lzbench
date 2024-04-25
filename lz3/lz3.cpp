@@ -770,6 +770,7 @@ static void LZ3_encode_of(vector<uint8_t>& seq, vector<pair<uint32_t, uint8_t>>&
             uint32_t d = x - cctx.of_base[c];
             ext.emplace_back(d, cctx.of_bits[c]);
         }
+        assert(y < 256);
         seq.push_back((uint8_t)y);
     }
     else
@@ -1124,10 +1125,6 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
         }
         blockPrev = count;
     }
-    if (blockBest > total * block_mode_threshold)
-    {
-        flag = flag | LZ3_compress_flag::OffsetBlock;
-    }
     //ASTC may have NPOT line size
     cctx.lineSize = 0;
     uint32_t nonePrice = 0;
@@ -1161,7 +1158,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
             o -= 1;
             uint32_t x = o % divisor;
             uint32_t y = o / divisor;
-            if (y >= 64)
+            if (y >= 32)
             {
                 dim2.clear();
                 break;
@@ -1185,9 +1182,12 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
             break;
         }
     }
-    if (cctx.lineSize != 0)
+    if (blockBest > total * block_mode_threshold || (cctx.lineSize != 0 && cctx.blockLog != 0))
     {
         flag = flag | LZ3_compress_flag::OffsetBlock;
+    }
+    if (cctx.lineSize != 0)
+    {
         flag = flag | LZ3_compress_flag::OffsetTwoDim;
     }
     return flag;
@@ -1234,6 +1234,10 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 do
                 {
                     uint32_t mop = mOffPrice(match.offset);
+                    if (mop == (uint32_t)-1)
+                    {
+                        continue;
+                    }
                     for (uint32_t k = match.length; k >= min_match_length; --k)
                     {
                         uint32_t mlp = mLenPrice(k);
@@ -1290,7 +1294,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                             optimal.resize(lastPos + 1);
                         }
                         uint32_t mop = mOffPrice(furtherMatch.offset);
-                        if (mop >= mopBest)
+                        if (mop == (uint32_t)-1 || mop >= mopBest)
                         {
                             continue;
                         }
@@ -1618,6 +1622,10 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
                 offset -= 1;
                 uint32_t x = offset % cctx.lineSize;
                 uint32_t y = offset / cctx.lineSize;
+                if (y >= 32)
+                {
+                    return (uint32_t)-1;
+                }
                 uint8_t c = LZ3_of_code(x, cctx.flag, cctx.lineSize);
                 bits += mOffHist.eval_bits(c) + cctx.of_bits[c] * LZ3_BIT_COST_MUL;
                 c = (uint8_t)y;
