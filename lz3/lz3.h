@@ -40,6 +40,10 @@ extern "C" {
 #define LZ3_DISTANCE_MAX 0x7FFFu
 #endif 
 
+#ifndef LZ3_HUF_DISTANCE_MAX
+#define LZ3_HUF_DISTANCE_MAX 0x1FFFFu
+#endif 
+
 LZ3_API uint32_t LZ3_compress(const void* src, void* dst, uint32_t srcSize);
 
 LZ3_API uint32_t LZ3_decompress_fast(const void* src, void* dst, uint32_t dstSize);
