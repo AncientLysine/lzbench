@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -316,7 +317,7 @@ public:
     uint32_t price;
 
     LZ3_match_optm() :
-        LZ3_match_info{ 0 ,0, 0 }, literal(0), price((uint32_t)-1)
+        LZ3_match_info{ 0 ,0, 0 }, literal(0), price(numeric_limits<uint32_t>::max())
     {
     }
 };
@@ -770,7 +771,7 @@ static void LZ3_encode_of(vector<uint8_t>& seq, vector<pair<uint32_t, uint8_t>>&
             uint32_t d = x - cctx.of_base[c];
             ext.emplace_back(d, cctx.of_bits[c]);
         }
-        assert(y <= 0xFF);
+        assert(y <= numeric_limits<uint8_t>::max());
         if (y < 32)
         {
             seq.push_back((uint8_t)y);
@@ -1151,6 +1152,10 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
             continue;
         }
         uint32_t divisor = hist[i] >> cctx.blockLog;
+        if (divisor > numeric_limits<uint16_t>::max())
+        {
+            continue;
+        }
         uint32_t dim2Price = 0;
         unordered_map<uint32_t, uint32_t> dim2;
         for (const auto& p : cctx.offsets)
@@ -1168,7 +1173,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
             o -= 1;
             uint32_t x = o % divisor;
             uint32_t y = o / divisor;
-            if (y > 0xFF)
+            if (y > numeric_limits<uint8_t>::max())
             {
                 dim2.clear();
                 break;
@@ -1244,7 +1249,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 do
                 {
                     uint32_t mop = mOffPrice(match.offset);
-                    if (mop == (uint32_t)-1)
+                    if (mop == numeric_limits<uint32_t>::max())
                     {
                         continue;
                     }
@@ -1286,7 +1291,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 {
                     /* Set prices using further matches found */
                     uint32_t lLen = optimal[j].length == 0 ? optimal[j].literal : 0;
-                    uint32_t mopBest = (uint32_t)-1;
+                    uint32_t mopBest = numeric_limits<uint32_t>::max();
                     uint32_t furtherLength = min_match_length;
                     while (j + furtherLength <= lastPos && optimal[j].price >= optimal[j + furtherLength].price)
                     {
@@ -1309,7 +1314,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                             optimal.resize(lastPos + 1);
                         }
                         uint32_t mop = mOffPrice(furtherMatch.offset);
-                        if (mop == (uint32_t)-1 || mop >= mopBest)
+                        if (mop == numeric_limits<uint32_t>::max() || mop >= mopBest)
                         {
                             continue;
                         }
@@ -1609,7 +1614,7 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
                 uint32_t y = offset / cctx.lineSize;
                 uint8_t c = LZ3_of_code(x, cctx.flag, cctx.lineSize);
                 mOffHist.inc_stats(c, count);
-                assert(y <= 0xFF);
+                assert(y <= numeric_limits<uint8_t>::max());
                 if (y < 32)
                 {
                     c = (uint8_t)y;
@@ -1651,14 +1656,14 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
                 {
                     c = (uint8_t)y;
                 }
-                else if (y <= 0xFF)
+                else if (y <= numeric_limits<uint8_t>::max())
                 {
                     bits += 8 * LZ3_BIT_COST_MUL;
                     c = 32;
                 }
                 else
                 {
-                    return (uint32_t)-1;
+                    return numeric_limits<uint32_t>::max();
                 }
                 bits += mOffHist.eval_bits(c) + cctx.of_bits[c] * LZ3_BIT_COST_MUL;
             }
