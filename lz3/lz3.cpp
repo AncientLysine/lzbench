@@ -1617,13 +1617,12 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
                 assert(y <= numeric_limits<uint8_t>::max());
                 if (y < 32)
                 {
-                    c = (uint8_t)y;
+                    mOffHist.inc_stats((uint8_t)y, count);
                 }
                 else
                 {
-                    c = 32;
+                    mOffHist.inc_stats(32, count);
                 }
-                mOffHist.inc_stats(c, count);
             }
             else
             {
@@ -1652,20 +1651,18 @@ static size_t LZ3_compress_generic(const LZ3_suffix_array* psa, const uint8_t* s
                 uint32_t y = offset / cctx.lineSize;
                 uint8_t c = LZ3_of_code(x, cctx.flag, cctx.lineSize);
                 bits += mOffHist.eval_bits(c) + cctx.of_bits[c] * LZ3_BIT_COST_MUL;
-                if (y < 32)
-                {
-                    c = (uint8_t)y;
-                }
-                else if (y <= numeric_limits<uint8_t>::max())
-                {
-                    bits += 8 * LZ3_BIT_COST_MUL;
-                    c = 32;
-                }
-                else
+                if (y > numeric_limits<uint8_t>::max())
                 {
                     return numeric_limits<uint32_t>::max();
                 }
-                bits += mOffHist.eval_bits(c) + cctx.of_bits[c] * LZ3_BIT_COST_MUL;
+                if (y < 32)
+                {
+                    bits += mOffHist.eval_bits((uint8_t)y);
+                }
+                else 
+                {
+                    bits += mOffHist.eval_bits(32) + 8 * LZ3_BIT_COST_MUL;
+                }
             }
             else
             {
