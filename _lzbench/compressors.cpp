@@ -312,7 +312,7 @@ int64_t lzbench_lizard_decompress(char *inbuf, size_t insize, char *outbuf, size
 
 int64_t lzbench_lz3_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t level, size_t, char*)
 {
-	return LZ3_compress(inbuf, outbuf, (uint32_t)insize);
+	return LZ3_compress(inbuf, outbuf, (uint32_t)insize, (LZ3_CLevel)level);
 }
 
 int64_t lzbench_lz3_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t, size_t, char*)
@@ -323,7 +323,7 @@ int64_t lzbench_lz3_decompress(char *inbuf, size_t insize, char *outbuf, size_t 
 
 int64_t lzbench_lz3_compress_huf(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t level, size_t, char*)
 {
-	return LZ3_compress_HUF(inbuf, outbuf, (uint32_t)insize);
+	return LZ3_compress_HUF(inbuf, outbuf, (uint32_t)insize, (LZ3_CLevel)level);
 }
 
 int64_t lzbench_lz3_decompress_huf(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t, size_t, char*)
