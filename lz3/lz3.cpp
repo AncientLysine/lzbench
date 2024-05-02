@@ -16,6 +16,7 @@
 #include "zstd/lib/common/fse.h"
 
 #if !defined(NDEBUG) && (defined(LZ3_LOG_SA) || defined(LZ3_LOG_SEQ))
+#include <sstream>
 #include <fstream>
 #include <iomanip>
 #endif
@@ -357,7 +358,7 @@ LZ3_FORCE_INLINE static constexpr bool operator&(LZ3_compress_flag lhs, LZ3_comp
     return (static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs)) > 0;
 }
 
-#define LZ3_MAX_LL 35
+#define LZ3_MAX_LL 35u
 
 static constexpr uint16_t ll_base[LZ3_MAX_LL] = {
     0,        1,        2,        3,        4,        5,        6,        7,
@@ -391,7 +392,7 @@ static uint8_t LZ3_ll_code(uint32_t value)
     return value > 63 ? (LZ3_HIGH_BIT_32(value) + 19) : ll_code[value];
 }
 
-#define LZ3_MAX_ML 52
+#define LZ3_MAX_ML 52u
 
 static constexpr uint16_t ml_base[LZ3_MAX_ML] = {
     3,        4,        5,        6,        7,        8,        9,        10,
@@ -663,7 +664,7 @@ static void LZ3_encode_of(vector<uint8_t>& seq, vector<pair<uint32_t, uint8_t>>&
         if (offset == cctx.preOff[1] || offset == cctx.preOff[2])
         {
             seq.push_back(1);
-            ext.emplace_back(offset == cctx.preOff[1] ? 0u : 1u, (uint8_t)1u);
+            ext.emplace_back(offset == cctx.preOff[1] ? 0u : 1u, (uint8_t)1);
             return;
         }
     }
@@ -1617,8 +1618,15 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
             lLenPrice, mLenPrice, mOffPass2, lRawPrice,
             noneStats, noneStats, noneStats);
     }
-#if !defined(NDEBUG) && defined(LZ3_LOG_SEQ) 
-    ofstream cfs("LZ3_compress.csv");
+#if !defined(NDEBUG) && defined(LZ3_LOG_SEQ)
+    static uint32_t ci;
+    if (hisSize == 0)
+    {
+        ci = 0;
+    }
+    stringstream css;
+    css << "LZ3_compress." << ci++ << ".csv";
+    ofstream cfs(css.str());
     cfs << ",Literal,Match,Offset" << endl;
     srcPos = 0;
     for (const LZ3_match_info& match : cctx.matches)
@@ -1830,8 +1838,15 @@ static constexpr uint32_t wild_copy_length = 16;
 template<LZ3_entropy_coder coder, LZ3_history_pos hisPos>
 static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t dstSize, size_t preSize, const uint8_t* ext, size_t extSize)
 {
-#if !defined(NDEBUG) && defined(LZ3_LOG_SEQ) 
-    ofstream dfs("LZ3_decompress.csv");
+#if !defined(NDEBUG) && defined(LZ3_LOG_SEQ)
+    static uint32_t di;
+    if (preSize == 0)
+    {
+        di = 0;
+    }
+    stringstream dss;
+    dss << "LZ3_decompress." << di++ << ".csv";
+    ofstream dfs(dss.str());
     dfs << ",Literal,Match,Offset" << endl;
 #endif
     const uint8_t* srcPtr = src;
