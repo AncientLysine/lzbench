@@ -285,10 +285,10 @@ class LZ3_match_optm : public LZ3_match_info
 {
 public:
     uint32_t literal;
-    uint32_t price;
+    int64_t price;
 
     LZ3_match_optm() :
-        LZ3_match_info{ 0 ,0, 0 }, literal(0), price(numeric_limits<uint32_t>::max())
+        LZ3_match_info{ 0 ,0, 0 }, literal(0), price(numeric_limits<int64_t>::max())
     {
     }
 };
@@ -1179,7 +1179,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                     for (uint32_t k = match.length; k >= min_match_length; --k)
                     {
                         uint32_t mlp = mLenPrice(k);
-                        uint32_t price = optimal[0].price + mlp + mop;
+                        int64_t price = optimal[0].price + mlp + mop;
                         if (price < optimal[k].price)
                         {
                             optimal[k].position = match.position;
@@ -1197,7 +1197,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 {
                     /* Fix current position with one literal if cheaper */
                     uint32_t lLen = optimal[j - 1].length == 0 ? optimal[j - 1].literal + 1 : 1;
-                    uint32_t price = optimal[j - 1].price;
+                    int64_t price = optimal[j - 1].price;
                     price += lRawPrice(src[i + j - 1]);
                     price += lLenPrice(lLen);
                     price -= lLenPrice(lLen - 1);
@@ -1249,7 +1249,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                         for (uint32_t k = furtherMatch.length; k >= min_match_length; --k)
                         {
                             uint32_t mlp = mLenPrice(k);
-                            uint32_t price = optimal[j].price + mlp + mop;
+                            int64_t price = optimal[j].price + mlp + mop;
                             if (price < optimal[j + k].price)
                             {
                                 optimal[j + k].position = furtherMatch.position;
@@ -1272,6 +1272,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                     reverse.push_back(lastMatch);
                 }
                 uint32_t back = lastMatch.literal + lastMatch.length;
+                assert(back > 0);
                 if (j <= back)
                 {
                     break;
