@@ -297,8 +297,8 @@ enum LZ3_compress_param
 {
     MaxMatchDistance,
     SufficientMatchLength,
+    MaxMatchCount,
     MinFurtherOffset,
-    MaxFurtherCount,
     RepeatModeThreshold,
     BlockStepTolerance,
     BlockModeThreshold,
@@ -310,16 +310,16 @@ enum LZ3_compress_param
 
 static uint32_t default_params[LZ3_CLevel::LZ3_CLevel_Max + 1][LZ3_compress_param::Count] =
 {
-    { 0x7FFF,  128,  0,  4,   50, 80, 95, 90, 98,  0 },
-    { 0x7FFF,  128,  0,  4,   50, 80, 95, 90, 98,  0 }, //CLevel_Min
-    { 0x7FFF,  128,  0,  8,   50, 80, 95, 90, 98,  0 },
-    { 0x7FFF,  128,  0,  8,   50, 80, 95, 90, 98,  0 }, //CLevel_Fast
-    { 0xFFFF,  172,  1,  16,  50, 80, 95, 90, 98,  0 },
-    { 0xFFFF,  172,  1,  32,  50, 80, 95, 90, 99,  0 }, //CLevel_Normal
-    { 0xFFFF,  172,  2,  64,  50, 80, 95, 90, 99,  0 },
-    { 0x17FFF, 256,  4,  128, 50, 80, 95, 90, 99,  0 }, //CLevel_Optimal
-    { 0x17FFF, 256,  16, 256, 50, 80, 95, 90, 100, 0 },
-    { 0x17FFF, 384,  32, 512, 50, 80, 95, 90, 100, 0 }, //CLevel_MAX
+    { 0x7FFF,  128,  1,   0,  50, 80, 95, 90, 98,  0 },
+    { 0x7FFF,  128,  2,   0,  50, 80, 95, 90, 98,  0 }, //CLevel_Min
+    { 0x7FFF,  128,  4,   0,  50, 80, 95, 90, 98,  0 },
+    { 0x7FFF,  128,  8,   0,  50, 80, 95, 90, 98,  0 }, //CLevel_Fast
+    { 0xFFFF,  172,  16,  1,  50, 80, 95, 90, 98,  0 },
+    { 0xFFFF,  172,  32,  1,  50, 80, 95, 90, 99,  0 }, //CLevel_Normal
+    { 0xFFFF,  172,  64,  2,  50, 80, 95, 90, 99,  0 },
+    { 0x17FFF, 256,  128, 4,  50, 80, 95, 90, 99,  0 }, //CLevel_Optimal
+    { 0x17FFF, 256,  256, 16, 50, 80, 95, 90, 100, 0 },
+    { 0x1FFFE, 384,  512, 64, 50, 80, 95, 90, 100, 0 }, //CLevel_MAX
 };
 
 enum class LZ3_entropy_coder
@@ -711,7 +711,7 @@ static void LZ3_encode_of(vector<uint8_t>& seq, vector<pair<uint32_t, uint8_t>>&
         }
         else
         {
-            seq.push_back(0);
+            seq.push_back(2);
             ext.emplace_back(y, (uint8_t)8);
         }
     }
@@ -794,10 +794,10 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
         if (c - 3 >= 4)
             x += (uint32_t)BIT_readBitsFast(&dctx.bitStr, dctx.of_bits[c]);
         uint32_t y = *seqPtr++;
-        if (y == 0)
-            y += (uint32_t)BIT_readBitsFast(&dctx.bitStr, 8);
-        else
+        if (y >= 3)
             y -= 3;
+        else
+            y =  (uint32_t)BIT_readBitsFast(&dctx.bitStr, 8);
         return { (x + y * l + 1) << b, 2 };
     }
     else
@@ -1137,7 +1137,7 @@ template<
     typename LLenStats, typename MLenStats, typename MOffStats>
 static vector<LZ3_match_info> LZ3_compress_opt(
     const LZ3_suffix_array* psa, const uint8_t* src, size_t srcSize,
-    uint32_t max_distance, uint32_t sufficient_length, uint32_t further_offset, uint32_t further_count,
+    uint32_t max_distance, uint32_t sufficient_length, uint32_t match_count, uint32_t further_offset,
     LLenPrice lLenPrice, MLenPrice mLenPrice, MOffPrice mOffPrice, LRawPrice lRawPrice,
     LLenStats lLenStats, MLenStats mLenStats, MOffStats mOffStats)
 {
@@ -1169,7 +1169,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 optimal[0].literal = lLen;
                 optimal[0].price = lLenPrice(lLen);
                 /* Set prices for first matches */
-                do
+                for (uint32_t count = 0; count < match_count; match.match_next(psa, min_match_length, max_distance), ++count)
                 {
                     uint32_t mop = mOffPrice(match.offset);
                     if (mop == numeric_limits<uint32_t>::max())
@@ -1190,7 +1190,6 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                         }
                     }
                 }
-                while (match.match_next(psa, min_match_length, max_distance));
             }
             for (uint32_t j = 1; j <= lastPos; ++j)
             {
@@ -1225,7 +1224,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                         furtherLength++;
                     }
                     LZ3_match_iter furtherMatch(psa, i + hisSize + j);
-                    for (uint32_t furtherCount = 0; furtherCount < further_count && furtherMatch.match_next(psa, furtherLength, max_distance); ++furtherCount)
+                    for (uint32_t furtherCount = 0; furtherCount < match_count && furtherMatch.match_next(psa, furtherLength, max_distance); ++furtherCount)
                     {
                         if (j + furtherMatch.length > lastPos)
                         {
@@ -1303,7 +1302,6 @@ template<LZ3_entropy_coder coder>
 static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, const uint8_t* src, uint8_t* dst, size_t srcSize)
 {
     LZ3_CCtx cctx;
-    copy_n(par, LZ3_compress_param::Count, cctx.params);
     uint32_t hisSize = psa->n - (uint32_t)srcSize;
     uint32_t srcPos = 0;
 #if !defined(NDEBUG) && defined(LZ3_LOG_SA)
@@ -1378,13 +1376,15 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
         };
         auto noneStats = [](uint32_t) {};
         auto mOffStats = [&cctx](uint32_t v) { cctx.offsets[v]++; };
+        LZ3_init_params(cctx.params, LZ3_CLevel_Min, coder);
         cctx.matches = LZ3_compress_opt(psa, src, srcSize,
             cctx.params[LZ3_compress_param::MaxMatchDistance],
             cctx.params[LZ3_compress_param::SufficientMatchLength],
+            cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
-            cctx.params[LZ3_compress_param::MaxFurtherCount],
             lLenPrice, mLenPrice, mOffCluster, lRawPrice,
             noneStats, noneStats, mOffStats);
+        copy_n(par, LZ3_compress_param::Count, cctx.params);
         vector<uint32_t> dict;
         for (auto i = cctx.offsets.begin(); i != cctx.offsets.end();)
         {
@@ -1429,8 +1429,8 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
         cctx.matches = LZ3_compress_opt(psa, src, srcSize,
             cctx.params[LZ3_compress_param::MaxMatchDistance],
             cctx.params[LZ3_compress_param::SufficientMatchLength],
+            cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
-            cctx.params[LZ3_compress_param::MaxFurtherCount],
             lLenPrice, mLenPrice, mOffPrice, lRawPrice,
             noneStats, noneStats, noneStats);
     }
@@ -1505,13 +1505,15 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
             mOffHist.eval_base();
             cctx.offsets[v]++;
         };
+        LZ3_init_params(cctx.params, LZ3_CLevel_Min, coder);
         cctx.matches = LZ3_compress_opt(psa, src, srcSize,
             cctx.params[LZ3_compress_param::MaxMatchDistance],
             cctx.params[LZ3_compress_param::SufficientMatchLength],
+            cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
-            cctx.params[LZ3_compress_param::MaxFurtherCount],
             lLenPrice, mLenPrice, mOffPass1, lRawPrice,
             lLenStats, mLenStats, mOffStats);
+        copy_n(par, LZ3_compress_param::Count, cctx.params);
         //calc 2nd pass code hist
         cctx.flag = LZ3_detect_compress_flags(cctx);
         lRawHist.clear();
@@ -1562,7 +1564,7 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
                 }
                 else
                 {
-                    mOffHist.inc_stats(0, count);
+                    mOffHist.inc_stats(2, count);
                 }
             }
             else
@@ -1602,7 +1604,7 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
                 }
                 else 
                 {
-                    bits += mOffHist.eval_bits(0) + 8 * LZ3_BIT_COST_MUL;
+                    bits += mOffHist.eval_bits(2) + 8 * LZ3_BIT_COST_MUL;
                 }
             }
             else
@@ -1617,8 +1619,8 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
         cctx.matches = LZ3_compress_opt(psa, src, srcSize,
             cctx.params[LZ3_compress_param::MaxMatchDistance],
             cctx.params[LZ3_compress_param::SufficientMatchLength],
+            cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
-            cctx.params[LZ3_compress_param::MaxFurtherCount],
             lLenPrice, mLenPrice, mOffPass2, lRawPrice,
             noneStats, noneStats, noneStats);
     }
