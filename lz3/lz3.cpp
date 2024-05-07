@@ -1169,7 +1169,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 optimal[0].literal = lLen;
                 optimal[0].price = lLenPrice(lLen);
                 /* Set prices for first matches */
-                for (uint32_t count = 0; count < match_count; match.match_next(psa, min_match_length, max_distance), ++count)
+                for (uint32_t count = 0; count < match_count; ++count)
                 {
                     uint32_t mop = mOffPrice(match.offset);
                     if (mop == numeric_limits<uint32_t>::max())
@@ -1188,6 +1188,10 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                             optimal[k].literal = lLen;
                             optimal[k].price = price;
                         }
+                    }
+                    if (!match.match_next(psa, min_match_length, max_distance))
+                    {
+                        break;
                     }
                 }
             }
@@ -1224,8 +1228,12 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                         furtherLength++;
                     }
                     LZ3_match_iter furtherMatch(psa, i + hisSize + j);
-                    for (uint32_t furtherCount = 0; furtherCount < match_count && furtherMatch.match_next(psa, furtherLength, max_distance); ++furtherCount)
+                    for (uint32_t furtherCount = 0; furtherCount < match_count; ++furtherCount)
                     {
+                        if (!furtherMatch.match_next(psa, furtherLength, max_distance))
+                        {
+                            break;
+                        }
                         if (j + furtherMatch.length > lastPos)
                         {
                             lastPos = j + furtherMatch.length;
