@@ -1062,13 +1062,15 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
     }
     //ASTC may have NPOT line size
     cctx.lineSize = 0;
-    uint32_t nonePrice = 0;
-    nonePrice += (uint32_t)cctx.offsets.size() * 16u * LZ3_BIT_COST_MUL;
+    uint64_t nonePrice = 0;
+    uint32_t noneMax = 0;
     for (const auto& p : cctx.offsets)
     {
         uint32_t l = LZ3_weight(total) - LZ3_weight(p.second);
         nonePrice += l * p.second;
+        noneMax = max(noneMax, p.first);
     }
+    nonePrice += cctx.offsets.size() * LZ3_HIGH_BIT_32(noneMax) * LZ3_BIT_COST_MUL;
     for (uint32_t i = 0; i < hist.size() && i < 8u; ++i)
     {
         if (hist[i] % (1 << cctx.blockLog) != 0)
@@ -1080,23 +1082,21 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
         {
             continue;
         }
-        uint32_t dim2Price = 0;
         unordered_map<uint32_t, uint32_t> dim2;
         for (const auto& p : cctx.offsets)
         {
-            uint32_t o = p.first;
+            uint32_t offset = p.first;
             uint32_t count = p.second;
-            uint32_t r = o & ((1 << cctx.blockLog) - 1);
+            uint32_t r = offset & ((1 << cctx.blockLog) - 1);
             if (r != 0)
             {
                 dim2[divisor] += count;
-                dim2Price += cctx.blockLog * LZ3_BIT_COST_MUL;
-                o += (1 << cctx.blockLog) - r;
+                offset += (1 << cctx.blockLog) - r;
             }
-            o >>= cctx.blockLog;
-            o -= 1;
-            uint32_t x = o % divisor;
-            uint32_t y = o / divisor;
+            offset >>= cctx.blockLog;
+            offset -= 1;
+            uint32_t x = offset % divisor;
+            uint32_t y = offset / divisor;
             if (y > numeric_limits<uint8_t>::max())
             {
                 dim2.clear();
@@ -1109,12 +1109,15 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
         {
             continue;
         }
-        dim2Price += (uint32_t)dim2.size() * 8u * LZ3_BIT_COST_MUL;
+        uint64_t dim2Price = 0;
+        uint32_t dim2Max = 0;
         for (const auto& p : dim2)
         {
             uint32_t l = LZ3_weight(total * 2) - LZ3_weight(p.second);
             dim2Price += l * p.second;
+            dim2Max = max(dim2Max, p.first);
         }
+        dim2Price += dim2.size() * LZ3_HIGH_BIT_32(dim2Max) * LZ3_BIT_COST_MUL;
         if (dim2Price < nonePrice * cctx.params[LZ3_compress_param::Dim2ModeThreshold] / 100)
         {
             cctx.lineSize = divisor;
