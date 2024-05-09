@@ -1169,6 +1169,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 optimal[0].literal = lLen;
                 optimal[0].price = lLenPrice(lLen);
                 /* Set prices for first matches */
+                int64_t llp = optimal[0].price + lLenPrice(0);
                 for (uint32_t count = 0; count < match_count; ++count)
                 {
                     uint32_t mop = mOffPrice(match.offset);
@@ -1179,7 +1180,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                     for (uint32_t k = match.length; k >= min_match_length; --k)
                     {
                         uint32_t mlp = mLenPrice(k);
-                        int64_t price = optimal[0].price + mlp + mop;
+                        int64_t price = llp + mlp + mop;
                         if (price < optimal[k].price)
                         {
                             optimal[k].position = match.position;
@@ -1227,6 +1228,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                     {
                         furtherLength++;
                     }
+                    int64_t llp = optimal[j].price + lLenPrice(0);
                     LZ3_match_iter furtherMatch(psa, i + hisSize + j);
                     for (uint32_t furtherCount = 0; furtherCount < match_count; ++furtherCount)
                     {
@@ -1256,7 +1258,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                         for (uint32_t k = furtherMatch.length; k >= min_match_length; --k)
                         {
                             uint32_t mlp = mLenPrice(k);
-                            int64_t price = optimal[j].price + mlp + mop;
+                            int64_t price = llp + mlp + mop;
                             if (price < optimal[j + k].price)
                             {
                                 optimal[j + k].position = furtherMatch.position;
