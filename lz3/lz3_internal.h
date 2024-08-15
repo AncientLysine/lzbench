@@ -115,3 +115,72 @@ LZ3_FORCE_INLINE static uint32_t LZ3_read_VL78(const uint8_t*& src, uint16_t tok
         return dict[(token >> 8) & 0x7F];
     }
 }
+
+template<size_t length>
+LZ3_FORCE_INLINE static void LZ3_wild_copy(uint8_t* dst, uint8_t* dstEnd, const uint8_t* src)
+{
+    do
+    {
+        memcpy(dst, src, length);
+        dst += length;
+        src += length;
+    } while (dst < dstEnd);
+}
+
+template<size_t length>
+static void LZ3_safe_copy(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, const uint8_t* src)
+{
+    if (dstEnd <= dstShortEnd)
+    {
+        LZ3_wild_copy<length>(dst, dstEnd, src);
+        return;
+    }
+    if (dst < dstShortEnd)
+    {
+        LZ3_wild_copy<length>(dst, dstShortEnd, src);
+        src += dstShortEnd - dst;
+        dst += dstShortEnd - dst;
+    }
+    while (dst < dstEnd)
+    {
+        *dst++ = *src++;
+    }
+}
+
+template<size_t length>
+static void LZ3_safe_move(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, const uint8_t* src)
+{
+    if (dst + 8 > dstEnd)
+    {
+        while (dst < dstEnd)
+        {
+            *dst++ = *src++;
+        }
+        return;
+    }
+    ptrdiff_t offset = dst - src;
+    if (offset >= 8)
+    {
+        memcpy(dst, src, 8);
+    }
+    else
+    {
+        static constexpr ptrdiff_t dec32table[] = { 0, 1, 2, 1, 4, 4, 4, 4 };   /* added */
+        static constexpr ptrdiff_t dec64table[] = { 8, 8, 8, 7, 8, 9,10,11 };   /* subtracted */
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = src[3];
+        src += dec32table[offset];
+        memcpy(dst + 4, src, 4);
+        src -= dec64table[offset];
+    }
+    dst += 8;
+    src += 8;
+    if (length > 8u && offset < length)
+    {
+        LZ3_safe_copy<8u>(dst, dstEnd, dstShortEnd, src);
+        return;
+    }
+    LZ3_safe_copy<length>(dst, dstEnd, dstShortEnd, src);
+}
