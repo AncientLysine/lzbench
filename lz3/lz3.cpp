@@ -1089,27 +1089,27 @@ LZ3_FORCE_INLINE static uint32_t LZ3_weight(uint32_t freq)
 class LZ3_code_hist
 {
     uint32_t freq[256];
-    uint32_t total;
+    uint32_t size;
     uint32_t base;
 
 public:
     LZ3_code_hist() :
-        freq{ 0 }, total(0), base(0)
+        freq{ 0 }, size(0), base(0)
     {
     }
 
     void inc_stats(uint8_t code, uint32_t inc = 1)
     {
         freq[code] += inc;
-        total += inc;
+        size += inc;
     }
 
     void eval_base()
     {
-        base = LZ3_weight(total);
+        base = LZ3_weight(size);
     }
 
-    uint32_t eval_bits(uint8_t code)
+    uint32_t eval_bits(uint8_t code) const
     {
         return base - LZ3_weight(freq[code]);
     }
@@ -1117,7 +1117,7 @@ public:
     void clear()
     {
         fill_n(freq, 256, 0);
-        total = 0;
+        size = 0;
         base = 0;
     }
 };
@@ -1636,9 +1636,28 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
     {
         //init 1st pass code hist
         LZ3_code_hist lRawHist;
-        for (uint32_t i = 0; i < srcSize; ++i)
+        for (uint32_t i = 0; i < srcSize;)
         {
-            lRawHist.inc_stats(src[i]);
+            LZ3_match_iter match(psa, i + hisSize);
+            if (match.match_next(psa, min_match_length, maxDistance))
+            {
+                uint32_t lastPos = match.length;
+                for (uint32_t j = lastPos - min_match_length + 1; j < lastPos; ++j)
+                {
+                    LZ3_match_iter furtherMatch(psa, i + j);
+                    if (furtherMatch.match_next(psa, min_match_length, maxDistance))
+                    {
+                        lastPos = j + furtherMatch.length;
+                        j = lastPos - min_match_length + 1;
+                    }
+                }
+                i += lastPos;
+            }
+            else
+            {
+                lRawHist.inc_stats(src[i]);
+                ++i;
+            }
         }
         LZ3_code_hist lLenHist;
         static constexpr uint32_t baseLLFreqs[LZ3_MAX_LL + 1] = {
