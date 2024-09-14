@@ -1174,7 +1174,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
     for (uint32_t i = 2; i <= 4; ++i)
     {
         uint32_t count = 0;
-        for (const pair<uint32_t, uint32_t>& p : hist)
+        for (const auto& p : hist)
         {
             if (p.first % (1 << i) == 0)
             {
@@ -1196,7 +1196,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
     cctx.lineSize = 0;
     vector<pair<uint8_t, uint32_t>> codeHist;
     LZ3_code_hist noneHist;
-    for (const pair<uint32_t, uint32_t>& p : hist)
+    for (const auto& p : hist)
     {
         uint32_t offset = p.first;
         uint32_t count = p.second;
@@ -1206,7 +1206,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
     }
     noneHist.eval_base();
     uint64_t nonePrice = 0;
-    for (const pair<uint32_t, uint32_t>& p : codeHist)
+    for (const auto& p : codeHist)
     {
         nonePrice += (noneHist.eval_bits(p.first) + of_bits[p.first] * LZ3_BIT_COST_MUL) * p.second;
     }
