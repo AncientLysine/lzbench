@@ -58,8 +58,10 @@ LZ3_API uint32_t LZ3_compress(const void* src, void* dst, uint32_t srcSize, LZ3_
 LZ3_API uint32_t LZ3_decompress_fast(const void* src, void* dst, uint32_t dstSize);
 
 LZ3_API uint32_t LZ3_compress_HUF(const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level);
+LZ3_API uint32_t LZ3_compress_FSE(const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level);
 
 LZ3_API uint32_t LZ3_decompress_HUF_fast(const void* src, void* dst, uint32_t dstSize);
+LZ3_API uint32_t LZ3_decompress_FSE_fast(const void* src, void* dst, uint32_t dstSize);
 
 typedef struct LZ3_CStream LZ3_CStream;
 
@@ -79,9 +81,12 @@ LZ3_API uint32_t LZ3_decompress_continue(LZ3_DStream* pcs, const void* src, void
 LZ3_API uint32_t LZ3_decompress_fast_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
 
 LZ3_API uint32_t LZ3_compress_HUF_continue(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level);
+LZ3_API uint32_t LZ3_compress_FSE_continue(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level);
 
 LZ3_API uint32_t LZ3_decompress_HUF_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
+LZ3_API uint32_t LZ3_decompress_FSE_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
 LZ3_API uint32_t LZ3_decompress_HUF_fast_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
+LZ3_API uint32_t LZ3_decompress_FSE_fast_continue(LZ3_DStream* pcs, const void* src, void* dst, uint32_t dstSize);
 
 #if defined (__cplusplus)
 }
