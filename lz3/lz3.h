@@ -33,7 +33,7 @@ extern "C" {
 #endif
 
 #ifndef LZ3_MAX_BLOCK_SIZE
-#define LZ3_MAX_BLOCK_SIZE 0xFF81u
+#define LZ3_MAX_BLOCK_SIZE 0x1FF81u
 #endif 
 
 #ifndef LZ3_DISTANCE_MAX
