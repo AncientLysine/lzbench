@@ -5,33 +5,50 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #define LZ3_FORCE_INLINE      inline __attribute__((always_inline))
-#define LZ3_LIKELY(expr)      __builtin_expect(!!(expr), 1)
-#define LZ3_UNLIKELY(expr)    __builtin_expect(!!(expr), 0)
+#define LZ3_NO_INLINE         __attribute__((noinline))
+#define LZ3_ALIGNED(size)     __attribute__((aligned(size)))
+#define LZ3_LIKELY(expr)      (__builtin_expect(!!(expr), 1))
+#define LZ3_UNLIKELY(expr)    (__builtin_expect(!!(expr), 0))
 #define LZ3_UNREACHABLE       __builtin_unreachable()
 #define LZ3_HIGH_BIT_32(expr) ((uint8_t)(31 - __builtin_clz((uint32_t)(expr))))
 #elif defined(_MSC_VER)
-#include <intrin.h>
 #define LZ3_FORCE_INLINE      __forceinline
-#define LZ3_LIKELY(expr)      (expr)
-#define LZ3_UNLIKELY(expr)    (expr)
+#define LZ3_NO_INLINE         __declspec(noinline)
+#define LZ3_ALIGNED(size)     __declspec(align(size))
+#if __cplusplus >= 202002L
+#define LZ3_LIKELY(expr)      ((expr)) [[likely]]
+#define LZ3_UNLIKELY(expr)    ((expr)) [[unlikely]]
+#else
+#define LZ3_LIKELY(expr)      ((expr))
+#define LZ3_UNLIKELY(expr)    ((expr))
+#endif
 #define LZ3_UNREACHABLE       __assume(0)
-#define LZ3_HIGH_BIT_32(expr) [](uint32_t v) {\
-    unsigned long r;\
-    _BitScanReverse(&r, v);\
-    return (uint8_t)r; } ((uint32_t)(expr))
+#include <intrin.h>
+LZ3_FORCE_INLINE uint8_t LZ3_high_bit_32(uint32_t v)
+{
+    unsigned long r;
+    _BitScanReverse(&r, v);
+    return (uint8_t)r;
+}
+#define LZ3_HIGH_BIT_32(expr) LZ3_high_bit_32((uint32_t)(expr))
 #else
 #define LZ3_FORCE_INLINE      inline
-#define LZ3_LIKELY(expr)      (expr)
-#define LZ3_UNLIKELY(expr)    (expr)
-#define LZ3_UNREACHABLE       
-#define LZ3_HIGH_BIT_32(expr) [](uint32_t v) {\
-    static constexpr uint8_t DeBruijnClz[32] = { 0, 9, 1, 10, 13, 21, 2, 29, 11, 14, 16, 18, 22, 25, 3, 30, 8, 12, 20, 28, 15, 17, 24, 7, 19, 27, 23, 6, 26, 5, 4, 31 };\
-    v |= v >> 1; \
-    v |= v >> 2; \
-    v |= v >> 4; \
-    v |= v >> 8; \
-    v |= v >> 16;\
-    return DeBruijnClz[(v * 0x07C4ACDDU) >> 27]; } ((uint32_t)(expr))
+#define LZ3_NO_INLINE
+#define LZ3_ALIGNED(size)
+#define LZ3_LIKELY(expr)      ((expr))
+#define LZ3_UNLIKELY(expr)    ((expr))
+#define LZ3_UNREACHABLE
+LZ3_FORCE_INLINE uint8_t LZ3_high_bit_32(uint32_t v)
+{
+    static constexpr uint8_t DeBruijnClz[32] = { 0, 9, 1, 10, 13, 21, 2, 29, 11, 14, 16, 18, 22, 25, 3, 30, 8, 12, 20, 28, 15, 17, 24, 7, 19, 27, 23, 6, 26, 5, 4, 31 };
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return DeBruijnClz[(v * 0x07C4ACDDU) >> 27];
+}
+#define LZ3_HIGH_BIT_32(expr) LZ3_high_bit_32((uint32_t)(expr))
 #endif
 
 LZ3_FORCE_INLINE static void LZ3_write_LE16(uint8_t*& dst, uint16_t value)
