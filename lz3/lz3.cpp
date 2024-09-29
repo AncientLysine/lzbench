@@ -11,6 +11,7 @@
 #define LZ3_LIBRARY
 #include "lz3.h"
 #include "lz3_internal.h"
+#include "lz3_neon.h"
 #include "zstd/lib/common/bitstream.h"
 #define HUF_STATIC_LINKING_ONLY
 #include "zstd/lib/common/huf.h"
@@ -2354,7 +2355,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     LZ3_of_decoder decodeOfWrapper = nullptr;
     uint8_t* buf = nullptr;
     const uint8_t* lusPtr = nullptr;
-    const uint8_t* lmsPtr[16] = { nullptr };
+    const uint8_t* lmsPtr[32] = { nullptr };
     const uint8_t* llsPtr = nullptr;
     const uint8_t* ofsPtr = nullptr;
     const uint8_t* mlsPtr = nullptr;
@@ -2481,6 +2482,43 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             else if (dctx.flag & LZ3_compress_flag::LiteralByIdx)
             {
                 uint8_t* cpyPtr = dstPtr;
+                if (cpyPtr < dstEnd - 64)
+                {
+                    memcpy(lmsPtr + 16, lmsPtr, sizeof(uintptr_t) * 16);
+                    size_t offset = (uintptr_t)dstPtr % 16;
+                    const uint8_t** litArr = lmsPtr + offset;
+                    while (true)
+                    {
+                        LZ3_4x16_copy(cpyPtr, litArr);
+                        if (cpyPtr < cpyEnd - 64)
+                        {
+                            for (size_t i = 0; i < 16; ++i)
+                            {
+                                litArr[i] += 4;
+                            }
+                            cpyPtr += 64;
+                        }
+                        else
+                        {
+                            size_t l = (cpyEnd - cpyPtr) % 16;
+                            size_t c = (cpyEnd - cpyPtr) / 16;
+                            for (size_t i = 0; i < l; ++i)
+                            {
+                                litArr[i] += c + 1;
+                            }
+                            for (size_t i = l; i < 16; ++i)
+                            {
+                                litArr[i] += c;
+                            }
+                            for (size_t i = 0; i < offset; ++i)
+                            {
+                                lmsPtr[i] = lmsPtr[i + 16];
+                            }
+                            cpyPtr = cpyEnd;
+                            break;
+                        }
+                    }
+                }
                 while (cpyPtr < cpyEnd)
                 {
                     const uint8_t*& litPtr = lmsPtr[(uintptr_t)cpyPtr % 16];
