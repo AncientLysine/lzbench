@@ -39,7 +39,7 @@ class LZ3_suffix_array
 public:
     uint32_t n;
     
-    LZ3_suffix_array(uint32_t l = 0)
+    explicit LZ3_suffix_array(uint32_t l = 0)
     {
         n = l;
         sa = &buffer[0];
@@ -346,6 +346,7 @@ enum class LZ3_entropy_flag : uint8_t
     EndOfStream  = 1,
     Compressed   = 2,
     NewTable     = 4,
+    RunLength    = 8,
 };
 
 enum class LZ3_history_pos
@@ -611,8 +612,9 @@ static uint8_t LZ3_gen_of_book(uint32_t* base, uint8_t* bits, LZ3_compress_flag 
     {
         fill_n(base + i, LZ3_MIN_OF, 0);
         fill_n(bits + i, LZ3_MIN_OF, (uint8_t)0);
-        copy_n(ll_base, min(LZ3_LEN_OF - LZ3_MIN_OF, LZ3_MAX_LL + 1), base + i + LZ3_MIN_OF);
-        copy_n(ll_bits, min(LZ3_LEN_OF - LZ3_MIN_OF, LZ3_MAX_LL + 1), bits + i + LZ3_MIN_OF);
+        static_assert(LZ3_MAX_OF - LZ3_MIN_OF <= LZ3_MAX_LL, "increase LZ3_MAX_LL because dy_base/bits were simply copied from ll_base/bits");
+        copy_n(ll_base, LZ3_MAX_OF + 1 - LZ3_MIN_OF, base + i + LZ3_MIN_OF);
+        copy_n(ll_bits, LZ3_MAX_OF + 1 - LZ3_MIN_OF, bits + i + LZ3_MIN_OF);
         i += LZ3_LEN_OF;
     }
     //if (flag & LZ3_compress_flag::OffsetRepeat)
@@ -639,6 +641,7 @@ static uint8_t LZ3_gen_of_book(uint32_t* base, uint8_t* bits, LZ3_compress_flag 
         for (uint8_t j = 0; ; ++j)
         {
             uint8_t l = j / 2;
+            assert(i < LZ3_LEN_OF * 2);
             base[i] = b;
             bits[i] = l;
             i++;
@@ -656,7 +659,6 @@ static uint8_t LZ3_gen_of_book(uint32_t* base, uint8_t* bits, LZ3_compress_flag 
                 break;
             }
         }
-        assert(i < LZ3_LEN_OF * 2);
     }
     else
     {
@@ -664,6 +666,7 @@ static uint8_t LZ3_gen_of_book(uint32_t* base, uint8_t* bits, LZ3_compress_flag 
         for (uint8_t j = 0; ; ++j)
         {
             uint8_t l = j / 2;
+            assert(i < LZ3_LEN_OF * 2);
             base[i] = b;
             bits[i] = l;
             i++;
@@ -673,7 +676,6 @@ static uint8_t LZ3_gen_of_book(uint32_t* base, uint8_t* bits, LZ3_compress_flag 
                 break;
             }
         }
-        assert(i < LZ3_LEN_OF);
     }
     return i;
 }
@@ -732,7 +734,6 @@ LZ3_FORCE_INLINE static void LZ3_encode_of(Output out, uint32_t offset, LZ3_comp
         offset -= 1;
         uint32_t x = offset % lineSize;
         uint32_t y = offset / lineSize;
-        assert(y <= numeric_limits<uint16_t>::max());
         const uint32_t* dx_base = of_base + LZ3_LEN_OF;
         const uint32_t* dy_base = of_base;
         const uint8_t* dx_bits = of_bits + LZ3_LEN_OF;
@@ -782,9 +783,9 @@ struct LZ3_decode_of_result
     size_t rax;
 };
 
-LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_make_decode_of_result(uint32_t seqLen, uint32_t offset, uint32_t offShl = 0)
+LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_make_decode_of_result(size_t seqLen, size_t offset)
 {
-    return { (((uint64_t)offset) << (32 + offShl)) | seqLen };
+    return { (offset << 32) | seqLen };
 }
 #else
 //use two reg to avoid shifting
@@ -804,17 +805,17 @@ struct LZ3_decode_of_result
     size_t rdx;
 };
 
-LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_make_decode_of_result(uint32_t seqLen, uint32_t offset, uint32_t offShl = 0)
+LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_make_decode_of_result(size_t seqLen, size_t offset)
 {
-    return { seqLen, offset << offShl };
+    return { seqLen, offset };
 }
 #endif
 
-template<uint32_t blockLog, uint32_t lineSize, LZ3_compress_flag flag>
+template<LZ3_compress_flag flag, uint32_t blockLog, uint32_t lineSize>
 LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr, LZ3_DCtx& dctx)
 {
-    uint32_t c = *seqPtr++;
-    if (flag & LZ3_compress_flag::OffsetRepeat)
+    uint8_t c = *seqPtr++;
+    if LZ3_CONSTEXPRIF(flag & LZ3_compress_flag::OffsetRepeat)
     {
         if (c == 0)
         {
@@ -825,21 +826,29 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
             return LZ3_make_decode_of_result(1, dctx.preOff[1 + BIT_readBitsFast(&dctx.bitStr, 1)]);
         }
     }
-    uint32_t b = blockLog != 0 ? blockLog : dctx.blockLog;
-    if (flag & LZ3_compress_flag::OffsetBlock)
+    uint32_t b = blockLog;
+    if LZ3_CONSTEXPRIF(flag & LZ3_compress_flag::OffsetBlock)
     {
+        if (b == 0)
+        {
+            b = dctx.blockLog;
+        }
         if (c == 2)
         {
             uint32_t r = (uint32_t)BIT_readBitsFast(&dctx.bitStr, b);
-            constexpr LZ3_compress_flag xorFlag = flag ^ (LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock);
-            auto result = LZ3_decode_of<blockLog, lineSize, xorFlag>(seqPtr, dctx);
-            return LZ3_make_decode_of_result((uint32_t)result.seqLen() + 1, (uint32_t)result.offset() - r);
+            constexpr LZ3_compress_flag subFlag = flag ^ (LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock);
+            auto result = LZ3_decode_of<subFlag, 0, lineSize>(seqPtr, dctx);
+            return LZ3_make_decode_of_result(result.seqLen() + 1, (result.offset() << b) - r);
         }
     }
-    uint32_t l = lineSize != 0 ? lineSize : dctx.lineSize;
-    if (flag & LZ3_compress_flag::OffsetTwoDim)
+    uint32_t l = lineSize;
+    if LZ3_CONSTEXPRIF(flag & LZ3_compress_flag::OffsetTwoDim)
     {
-        uint32_t e = *seqPtr++; //extended code record dy
+        if (l == 0)
+        {
+            l = dctx.lineSize;
+        }
+        uint8_t e = *seqPtr++; //extended code record dy
         const uint32_t* dx_base = dctx.of_base + LZ3_LEN_OF;
         const uint32_t* dy_base = dctx.of_base;
         uint32_t x = dx_base[c];
@@ -855,7 +864,7 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
             y += (uint32_t)BIT_readBitsFast(&dctx.bitStr, dy_bits[e]);
         }
         uint32_t o = x + y * l + 1;
-        return LZ3_make_decode_of_result(2, o, b);
+        return LZ3_make_decode_of_result(2, (size_t)o << b);
     }
     else
     {
@@ -866,14 +875,14 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
             const uint8_t* of_bits = dctx.of_bits;
             o += (uint32_t)BIT_readBitsFast(&dctx.bitStr, of_bits[c]);
         }
-        return LZ3_make_decode_of_result(1, o, b);
+        return LZ3_make_decode_of_result(1, (size_t)o << b);
     }
 }
 
-template<uint32_t blockLog, uint32_t lineSize, LZ3_compress_flag flag>
+template<LZ3_compress_flag flag, uint32_t blockLog, uint32_t lineSize>
 LZ3_ALIGNED(0x40) static LZ3_decode_of_result LZ3_decode_of_wrapper(const uint8_t* seqPtr, LZ3_DCtx& dctx)
 {
-    auto result = LZ3_decode_of<blockLog, lineSize, flag>(seqPtr, dctx);
+    auto result = LZ3_decode_of<flag, blockLog, lineSize>(seqPtr, dctx);
     if (flag & LZ3_compress_flag::OffsetRepeat)
     {
         dctx.preOff[2] = dctx.preOff[1];
@@ -885,64 +894,94 @@ LZ3_ALIGNED(0x40) static LZ3_decode_of_result LZ3_decode_of_wrapper(const uint8_
 
 typedef LZ3_decode_of_result(*LZ3_of_decoder)(const uint8_t* seqPtr, LZ3_DCtx& dctx);
 
+template<LZ3_compress_flag flag, uint32_t lineSize>
+static LZ3_of_decoder LZ3_gen_of_decoder_blockLog(uint32_t blockLog)
+{
+    switch (blockLog)
+    {
+    case 2:
+        return &LZ3_decode_of_wrapper<flag, 2, lineSize>;
+    case 3:
+        return &LZ3_decode_of_wrapper<flag, 3, lineSize>;
+    case 4:
+        return &LZ3_decode_of_wrapper<flag, 4, lineSize>;
+    default:
+        return &LZ3_decode_of_wrapper<flag, 0, lineSize>;
+    }
+}
+
+template<LZ3_compress_flag flag, uint32_t blockLog>
+static LZ3_of_decoder LZ3_gen_of_decoder_lineSize(uint32_t lineSize)
+{
+    switch (lineSize)
+    {
+    case 43:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 43>;
+    case 52:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 52>;
+    case 64:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 64>;
+    case 86:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 86>;
+    case 103:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 103>;
+    case 128:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 128>;
+    case 171:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 171>;
+    case 205:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 205>;
+    case 256:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 256>;
+    case 342:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 342>;
+    case 410:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 410>;
+    case 512:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 512>;
+    default:
+        return &LZ3_decode_of_wrapper<flag, blockLog, 0>;
+    }
+}
+
+template<LZ3_compress_flag flag>
+static LZ3_of_decoder LZ3_gen_of_decoder(uint32_t blockLog, uint32_t lineSize)
+{
+    switch (blockLog)
+    {
+    case 2:
+        return LZ3_gen_of_decoder_lineSize<flag, 2>(lineSize);
+    case 3:
+        return LZ3_gen_of_decoder_lineSize<flag, 3>(lineSize);
+    case 4:
+        return LZ3_gen_of_decoder_lineSize<flag, 4>(lineSize);
+    default:
+        return LZ3_gen_of_decoder_lineSize<flag, 0>(lineSize);
+    }
+}
+
 static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockLog, uint32_t lineSize)
 {
     switch ((uint8_t)flag & 7)
     {
     case 0:
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::None>;
+        return &LZ3_decode_of_wrapper<LZ3_compress_flag::None, 0, 0>;
     case 1:
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat>;
+        return &LZ3_decode_of_wrapper<LZ3_compress_flag::OffsetRepeat, 0, 0>;
     case 2:
-        if (blockLog == 2)
-            return &LZ3_decode_of_wrapper<2, 0, LZ3_compress_flag::OffsetBlock>;
-        if (blockLog == 3)
-            return &LZ3_decode_of_wrapper<3, 0, LZ3_compress_flag::OffsetBlock>;
-        if (blockLog == 4)
-            return &LZ3_decode_of_wrapper<4, 0, LZ3_compress_flag::OffsetBlock>;
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetBlock>;
+        return LZ3_gen_of_decoder_blockLog<LZ3_compress_flag::OffsetBlock, 0>(blockLog);
     case 3:
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock>;
+        return &LZ3_decode_of_wrapper<LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock, 0, 0>;
     case 4:
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetTwoDim>;
+        return LZ3_gen_of_decoder_lineSize<LZ3_compress_flag::OffsetTwoDim, 0>(lineSize);
     case 5:
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetTwoDim>;
+        return &LZ3_decode_of_wrapper<LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetTwoDim, 0, 0>;
     case 6:
-        if (blockLog == 3 && lineSize == 64)
-            return &LZ3_decode_of_wrapper<3, 64,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 3 && lineSize == 128)
-            return &LZ3_decode_of_wrapper<3, 128, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 3 && lineSize == 256)
-            return &LZ3_decode_of_wrapper<3, 256, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 3 && lineSize == 512)
-            return &LZ3_decode_of_wrapper<3, 512, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 43)
-            return &LZ3_decode_of_wrapper<4, 43,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 52)      
-            return &LZ3_decode_of_wrapper<4, 52,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 64)      
-            return &LZ3_decode_of_wrapper<4, 64,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 86)      
-            return &LZ3_decode_of_wrapper<4, 86,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 103)
-            return &LZ3_decode_of_wrapper<4, 103, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 128)
-            return &LZ3_decode_of_wrapper<4, 128, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 171)
-            return &LZ3_decode_of_wrapper<4, 171, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 205)
-            return &LZ3_decode_of_wrapper<4, 205, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 256)
-            return &LZ3_decode_of_wrapper<4, 256, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 342)
-            return &LZ3_decode_of_wrapper<4, 342, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 410)
-            return &LZ3_decode_of_wrapper<4, 410, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 512)
-            return &LZ3_decode_of_wrapper<4, 512, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        return LZ3_gen_of_decoder<LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>(blockLog, lineSize);
+    case 7:
+        return &LZ3_decode_of_wrapper<LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim, 0, 0>;
     default:
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        LZ3_UNREACHABLE;
     }
 }
 
@@ -1049,17 +1088,10 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
         flag = flag | LZ3_compress_flag::OffsetRepeat;
     }
     total -= repeat;
-    vector<pair<uint32_t, uint32_t>> hist;
-    for (const auto& p : freq)
+    vector<pair<uint32_t, uint32_t>> hist(freq.begin(), freq.end());
+    sort(hist.begin(), hist.end(), [](const pair<uint32_t, uint32_t>& x, const pair<uint32_t, uint32_t>& y)
     {
-        if (p.second > 0)
-        {
-            hist.emplace_back(p.first, p.second);
-        }
-    }
-    stable_sort(hist.begin(), hist.end(), [](const pair<uint32_t, uint32_t>& x, const pair<uint32_t, uint32_t>& y)
-    {
-        return x.second > y.second;
+        return x.second != y.second ? x.second > y.second : x.first < y.first;
     });
     //consider only 4(rgb32), 8(etc1), 16(etc2/astc) byte block
     cctx.blockLog = 0;
@@ -1120,7 +1152,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
             continue;
         }
         divisor >>= cctx.blockLog;
-        if (divisor < 16 || divisor > numeric_limits<uint16_t>::max())
+        if (divisor < 16 || divisor > 1024)
         {
             continue;
         }
@@ -1140,22 +1172,12 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
             offset -= 1;
             uint32_t x = offset % divisor;
             uint32_t y = offset / divisor;
-            if (y > numeric_limits<uint16_t>::max())
-            {
-                divisor = 0;
-                break;
-            }
-            uint8_t code;
-            code = LZ3_dx_code(x, divisor);
-            codeHist.emplace_back(code, count);
-            dim2Hist.inc_stats(code, count);
-            code = LZ3_dy_code(y);
-            codeHist.emplace_back(code, count);
-            dim2Hist.inc_stats(code, count);
-        }
-        if (divisor ==0)
-        {
-            continue;
+            uint8_t c = LZ3_dx_code(x, divisor);
+            uint8_t e = LZ3_dy_code(y);
+            codeHist.emplace_back(c, count);
+            codeHist.emplace_back(e, count);
+            dim2Hist.inc_stats(c, count);
+            dim2Hist.inc_stats(e, count);
         }
         dim2Hist.eval_base();
         LZ3_gen_of_book(cctx.of_base, cctx.of_bits, flag | LZ3_compress_flag::OffsetTwoDim, cctx.blockLog, divisor);
@@ -1383,24 +1405,37 @@ static vector<LZ3_match_info> LZ3_compress_opt(
 struct LZ3_chunk_huf
 {
     LZ3_code_hist hist;
-    HUF_CElt table[HUF_CTABLE_SIZE_ST(255)];
+    HUF_CElt table[HUF_CTABLE_SIZE(255) / sizeof(HUF_CElt)];
     uint8_t header[256];
-    uint32_t hSize;
-    uint32_t cSize;
+    size_t hSize;
+    size_t cSize;
 
     explicit LZ3_chunk_huf(const LZ3_code_hist codeHist) :
         hist(codeHist)
     {
-        uint32_t maxSymbol = hist.max_code();
-        uint64_t wksp[HUF_WORKSPACE_SIZE_U64];
+        uint8_t maxSymbol = hist.max_code();
+        if (hist.freq[maxSymbol] == hist.size)
+        {
+            header[0] = maxSymbol;
+            hSize = 1;
+            cSize = 0;
+            return;
+        }
+        uint64_t wksp[HUF_WORKSPACE_SIZE / sizeof(uint64_t)];
         uint32_t hufLog = HUF_optimalTableLog(HUF_TABLELOG_DEFAULT, hist.size, maxSymbol);
         size_t maxBits = HUF_buildCTable_wksp(table, hist.freq, maxSymbol, hufLog, wksp, sizeof(wksp));
         hufLog = (uint32_t)maxBits;
-        size_t tSize = HUF_CTABLE_SIZE_ST(maxSymbol);
+        size_t tSize = HUF_CTABLE_SIZE(maxSymbol) / sizeof(HUF_CElt);
         size_t uSize = sizeof(table) - tSize * sizeof(HUF_CElt);
         memset(table + tSize, 0, uSize);
-        hSize = (uint32_t)HUF_writeCTable_wksp(header, sizeof(header), table, maxSymbol, hufLog, wksp, sizeof(wksp));
-        cSize = (uint32_t)HUF_estimateCompressedSize(table, hist.freq, maxSymbol);
+        hSize = HUF_writeCTable_wksp(header, sizeof(header), table, maxSymbol, hufLog, wksp, sizeof(wksp));
+        if (HUF_isError(hSize))
+        {
+            hSize = 0;
+            cSize = hist.size;
+            return;
+        }
+        cSize = HUF_estimateCompressedSize(table, hist.freq, maxSymbol);
     }
 
     bool compressible(uint32_t uncompressIntercept, uint32_t uncompressThreshold) const
@@ -1408,9 +1443,9 @@ struct LZ3_chunk_huf
         return hSize + cSize + uncompressIntercept < hist.size * uncompressThreshold / 100;
     }
 
-    uint32_t estimate_size() const
+    size_t estimate_size() const
     {
-        return 5 + min(hSize + cSize, hist.size);
+        return 5 + min(hSize + cSize, (size_t)hist.size);
     }
 };
 
@@ -1419,17 +1454,29 @@ struct LZ3_chunk_fse
     LZ3_code_hist hist;
     FSE_CTable table[FSE_CTABLE_SIZE_U32(FSE_MAX_TABLELOG, FSE_MAX_SYMBOL_VALUE)];
     uint8_t header[512];
-    uint32_t hSize;
-    uint32_t cSize;
+    size_t hSize;
+    size_t cSize;
 
     explicit LZ3_chunk_fse(const LZ3_code_hist codeHist) :
         hist(codeHist)
     {
-        uint32_t maxSymbol = hist.max_code();
+        uint8_t maxSymbol = hist.max_code();
+        if (hist.freq[maxSymbol] == hist.size)
+        {
+            header[0] = maxSymbol;
+            hSize = 1;
+            cSize = 0;
+            return;
+        }
         uint32_t tableLog = FSE_optimalTableLog(FSE_DEFAULT_TABLELOG, hist.size, maxSymbol);
         int16_t norm[FSE_MAX_SYMBOL_VALUE + 1];
         FSE_normalizeCount(norm, tableLog, hist.freq, hist.size, maxSymbol, hist.size > 2048);
-        hSize = (uint32_t)FSE_writeNCount(header, 512, norm, maxSymbol, tableLog);
+        hSize = FSE_writeNCount(header, 512, norm, maxSymbol, tableLog);
+        if (FSE_isError(hSize)) {
+            hSize = 0;
+            cSize = hist.size;
+            return;
+        }
         uint32_t wksp[FSE_BUILD_CTABLE_WORKSPACE_SIZE_U32(FSE_MAX_SYMBOL_VALUE, FSE_MAX_TABLELOG)];
         FSE_buildCTable_wksp(table, norm, maxSymbol, tableLog, wksp, sizeof(wksp));
         uint64_t bits = 0;
@@ -1438,7 +1485,7 @@ struct LZ3_chunk_fse
         {
             bits += hist.eval_bits((uint8_t)c) * (uint64_t)hist.freq[c];
         }
-        cSize = (uint32_t)(bits / LZ3_BIT_COST_MUL / 8);
+        cSize = (size_t)(bits / LZ3_BIT_COST_MUL / 8);
     }
 
     bool compressible(uint32_t uncompressIntercept, uint32_t uncompressThreshold) const
@@ -1446,9 +1493,9 @@ struct LZ3_chunk_fse
         return hSize + cSize + uncompressIntercept < hist.size * uncompressThreshold / 100;
     }
 
-    uint32_t estimate_size() const
+    size_t estimate_size() const
     {
-        return 3 + min(hSize + cSize, hist.size);
+        return 3 + min(hSize + cSize, (size_t)hist.size);
     }
 };
 
@@ -1529,40 +1576,45 @@ void LZ3_write_stream<LZ3_entropy_coder::Huff0>(uint8_t*& dst, const uint8_t* sr
         {
             *flag = (uint8_t)LZ3_entropy_flag::None;
             size_t rSize = min(remainSize, (size_t)0x10000);
-            size_t cSize = 0;
-            if (chunk.compressible(uncompressIntercept, uncompressThreshold))
+            do
             {
-                cSize = HUF_compress4X_usingCTable(
-                    dst + sizeof(uint16_t) * 2, HUF_compressBound(rSize),
-                    src, rSize, chunk.table);
-                if (HUF_isError(cSize))
+                if (chunk.hSize == 1 && chunk.cSize == 0)
                 {
-                    LZ3_last_error_name = HUF_getErrorName(cSize);
-                    return;
+                    *flag |= (uint8_t)LZ3_entropy_flag::RunLength;
+                    LZ3_write_LE16(dst, (uint16_t)(rSize - 1));
+                    *dst = chunk.header[0];
+                    src += rSize;
+                    dst += 1;
+                    break;
                 }
-            }
-            if (cSize == 0)
-            {
+                if (chunk.compressible(uncompressIntercept, uncompressThreshold))
+                {
+                    size_t cSize = HUF_compress4X_usingCTable(
+                        dst + sizeof(uint16_t) * 2, HUF_compressBound(rSize),
+                        src, rSize, chunk.table);
+                    if (cSize > 0 && !HUF_isError(cSize))
+                    {
+                        *flag |= (uint8_t)LZ3_entropy_flag::Compressed;
+                        LZ3_write_LE16(dst, (uint16_t)(cSize - 1));
+                        LZ3_write_LE16(dst, (uint16_t)(rSize - 1));
+                        src += rSize;
+                        dst += cSize;
+                        if (!tableWritten)
+                        {
+                            *flag |= (uint8_t)LZ3_entropy_flag::NewTable;
+                            memcpy(dst, chunk.header, chunk.hSize);
+                            dst += chunk.hSize;
+                            tableWritten = true;
+                        }
+                        break;
+                    }
+                }
                 LZ3_write_LE16(dst, (uint16_t)(rSize - 1));
                 memcpy(dst, src, rSize);
                 src += rSize;
                 dst += rSize;
             }
-            else
-            {
-                *flag |= (uint8_t)LZ3_entropy_flag::Compressed;
-                LZ3_write_LE16(dst, (uint16_t)(cSize - 1));
-                LZ3_write_LE16(dst, (uint16_t)(rSize - 1));
-                src += rSize;
-                dst += cSize;
-                if (!tableWritten)
-                {
-                    *flag |= (uint8_t)LZ3_entropy_flag::NewTable;
-                    memcpy(dst, chunk.header, chunk.hSize);
-                    dst += chunk.hSize;
-                    tableWritten = true;
-                }
-            }
+            while (false);
             remainSize -= rSize;
             flag = dst++;
         }
@@ -1585,39 +1637,44 @@ void LZ3_write_stream<LZ3_entropy_coder::FSE>(uint8_t*& dst, const uint8_t* src,
         {
             *flag = (uint8_t)LZ3_entropy_flag::None;
             size_t rSize = min(remainSize, (size_t)0x10000);
-            size_t cSize = 0;
-            if (chunk.compressible(uncompressIntercept, uncompressThreshold))
+            do
             {
-                cSize = FSE_compress_usingCTable(
-                    dst + sizeof(uint16_t), FSE_compressBound(rSize),
-                    src, rSize, chunk.table);
-                if (FSE_isError(cSize))
+                if (chunk.hSize == 1 && chunk.cSize == 0)
                 {
-                    LZ3_last_error_name = FSE_getErrorName(cSize);
-                    return;
+                    *flag |= (uint8_t)LZ3_entropy_flag::RunLength;
+                    LZ3_write_LE16(dst, (uint16_t)(rSize - 1));
+                    *dst = chunk.header[0];
+                    src += rSize;
+                    dst += 1;
+                    break;
                 }
-            }
-            if (cSize == 0)
-            {
+                if (chunk.compressible(uncompressIntercept, uncompressThreshold))
+                {
+                    size_t cSize = FSE_compress_usingCTable(
+                        dst + sizeof(uint16_t), FSE_compressBound(rSize),
+                        src, rSize, chunk.table);
+                    if (cSize > 0 && !FSE_isError(cSize))
+                    {
+                        *flag |= (uint8_t)LZ3_entropy_flag::Compressed;
+                        LZ3_write_LE16(dst, (uint16_t)(cSize - 1));
+                        src += rSize;
+                        dst += cSize;
+                        if (!tableWritten)
+                        {
+                            *flag |= (uint8_t)LZ3_entropy_flag::NewTable;
+                            memcpy(dst, chunk.header, chunk.hSize);
+                            dst += chunk.hSize;
+                            tableWritten = true;
+                        }
+                        break;
+                    }
+                }
                 LZ3_write_LE16(dst, (uint16_t)(rSize - 1));
                 memcpy(dst, src, rSize);
                 src += rSize;
                 dst += rSize;
             }
-            else
-            {
-                *flag |= (uint8_t)LZ3_entropy_flag::Compressed;
-                LZ3_write_LE16(dst, (uint16_t)(cSize - 1));
-                src += rSize;
-                dst += cSize;
-                if (!tableWritten)
-                {
-                    *flag |= (uint8_t)LZ3_entropy_flag::NewTable;
-                    memcpy(dst, chunk.header, chunk.hSize);
-                    dst += chunk.hSize;
-                    tableWritten = true;
-                }
-            }
+            while (false);
             remainSize -= rSize;
             flag = dst++;
         }
@@ -1637,6 +1694,7 @@ const uint8_t* LZ3_read_stream<LZ3_entropy_coder::Huff0>(const uint8_t*& src, ui
     uint32_t wksp[HUF_DECOMPRESS_WORKSPACE_SIZE_U32];
     HUF_CREATE_STATIC_DTABLEX1(tablex1, HUF_TABLELOG_MAX);
     HUF_CREATE_STATIC_DTABLEX2(tablex2, HUF_TABLELOG_MAX);
+    uint32_t algo = 0;
     const uint8_t* ptr = dst;
     while (true)
     {
@@ -1645,14 +1703,22 @@ const uint8_t* LZ3_read_stream<LZ3_entropy_coder::Huff0>(const uint8_t*& src, ui
         {
             break;
         }
+        if (flag & (uint8_t)LZ3_entropy_flag::RunLength)
+        {
+            size_t rSize = LZ3_read_LE16(src) + 1;
+            memset(dst, *src, rSize);
+            src += 1;
+            dst += rSize;
+            continue;
+        }
         if (flag & (uint8_t)LZ3_entropy_flag::Compressed)
         {
             size_t cSize = LZ3_read_LE16(src) + 1;
             size_t rSize = LZ3_read_LE16(src) + 1;
             size_t hSize = 0;
-            uint32_t algo = HUF_selectDecoder(rSize, cSize);
             if (flag & (uint8_t)LZ3_entropy_flag::NewTable)
             {
+                algo = HUF_selectDecoder(rSize, cSize);
                 if (algo == 0)
                 {
                     hSize = HUF_readDTableX1_wksp(tablex1, src + cSize, 256, wksp, sizeof(wksp));
@@ -1660,6 +1726,11 @@ const uint8_t* LZ3_read_stream<LZ3_entropy_coder::Huff0>(const uint8_t*& src, ui
                 else
                 {
                     hSize = HUF_readDTableX2_wksp(tablex2, src + cSize, 256, wksp, sizeof(wksp));
+                }
+                if (HUF_isError(hSize))
+                {
+                    LZ3_last_error_name = HUF_getErrorName(hSize);
+                    return nullptr;
                 }
             }
             if (algo == 0)
@@ -1677,14 +1748,12 @@ const uint8_t* LZ3_read_stream<LZ3_entropy_coder::Huff0>(const uint8_t*& src, ui
             }
             src += cSize + hSize;
             dst += rSize;
+            continue;
         }
-        else
-        {
-            size_t rSize = LZ3_read_LE16(src) + 1;
-            memcpy(dst, src, rSize);
-            src += rSize;
-            dst += rSize;
-        }
+        size_t rSize = LZ3_read_LE16(src) + 1;
+        memcpy(dst, src, rSize);
+        src += rSize;
+        dst += rSize;
     }
     return ptr;
 }
@@ -1702,6 +1771,14 @@ const uint8_t* LZ3_read_stream<LZ3_entropy_coder::FSE>(const uint8_t*& src, uint
         {
             break;
         }
+        if (flag & (uint8_t)LZ3_entropy_flag::RunLength)
+        {
+            size_t rSize = LZ3_read_LE16(src) + 1;
+            memset(dst, *src, rSize);
+            src += 1;
+            dst += rSize;
+            continue;
+        }
         if (flag & (uint8_t)LZ3_entropy_flag::Compressed)
         {
             size_t cSize = LZ3_read_LE16(src) + 1;
@@ -1711,6 +1788,11 @@ const uint8_t* LZ3_read_stream<LZ3_entropy_coder::FSE>(const uint8_t*& src, uint
             if (flag & (uint8_t)LZ3_entropy_flag::NewTable)
             {
                 hSize = FSE_readNCount(norm, &codeMax, &tableLog, src + cSize, 512);
+                if (FSE_isError(hSize))
+                {
+                    LZ3_last_error_name = FSE_getErrorName(hSize);
+                    return nullptr;
+                }
             }
             FSE_buildDTable(table, norm, codeMax, tableLog);
             size_t rSize = FSE_decompress_usingDTable(dst, dstCap, src, cSize, table);
@@ -1721,14 +1803,12 @@ const uint8_t* LZ3_read_stream<LZ3_entropy_coder::FSE>(const uint8_t*& src, uint
             }
             src += cSize + hSize;
             dst += rSize;
+            continue;
         }
-        else
-        {
-            size_t rSize = LZ3_read_LE16(src) + 1;
-            memcpy(dst, src, rSize);
-            src += rSize;
-            dst += rSize;
-        }
+        size_t rSize = LZ3_read_LE16(src) + 1;
+        memcpy(dst, src, rSize);
+        src += rSize;
+        dst += rSize;
     }
     return ptr;
 }
@@ -1852,7 +1932,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
                 i = freq.erase(i);
             }
         }
-        stable_sort(dict.begin(), dict.end(), [&freq](uint32_t x, uint32_t y)
+        sort(dict.begin(), dict.end(), [&freq](uint32_t x, uint32_t y)
         {
             return freq[x] != freq[y] ? freq[x] > freq[y] : x < y;
         });
@@ -2176,7 +2256,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         LZ3_write_stream<coder>(dstPtr, ofs.data(), ofs.size(), LZ3_MAX_OF, uci, uct);
         LZ3_write_stream<coder>(dstPtr, mls.data(), mls.size(), LZ3_MAX_ML, uci, uct);
         BIT_CStream_t bitStr;
-        BIT_initCStream(&bitStr, dstPtr + sizeof(uint16_t), ext.size() * 2/*15bit*/ + 1 + sizeof(size_t));
+        BIT_initCStream(&bitStr, dstPtr + sizeof(uint16_t), ext.size() * 3/*18bit*/ + 1 + sizeof(size_t));
         for (size_t i = ext.size(); i > 0; --i)
         {
             const pair<uint32_t, uint8_t>& bits = ext[i - 1];
@@ -2453,12 +2533,15 @@ uint32_t LZ3_compress_split_generic(const void* src, void* dst, uint32_t srcSize
         dstPos = LZ3_compress_continue_generic<coder>(pcs, src, dst, srcSize, level);
         LZ3_freeCStream(pcs);
     }
-    vector<uint8_t> test(srcSize);
-    assert(LZ3_decompress_split_fast_generic<coder>(dst, test.data(), srcSize) == dstPos);
+#if !defined(NDEBUG) && defined(LZ3_CHK_DEC)
+    vector<uint8_t> buf(srcSize);
+    size_t chkPos = LZ3_decompress_split_fast_generic<coder>(dst, buf.data(), srcSize);
+    assert(chkPos == dstPos);
     for (size_t i = 0; i < srcSize; ++i)
     {
-        assert(test[i] == ((const uint8_t*)src)[i]);
+        assert(buf[i] == ((const uint8_t*)src)[i]);
     }
+#endif
     return dstPos;
 }
 
