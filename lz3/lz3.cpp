@@ -344,14 +344,14 @@ enum class LZ3_history_pos
     Extern,
 };
 
-LZ3_FORCE_INLINE static constexpr LZ3_compress_flag operator|(LZ3_compress_flag lhs, LZ3_compress_flag rhs) 
+LZ3_FORCE_INLINE static constexpr LZ3_compress_flag operator|(LZ3_compress_flag lhs, LZ3_compress_flag rhs)
 {
     return static_cast<LZ3_compress_flag>(static_cast<uint8_t>(lhs) | static_cast<uint8_t>(rhs));
 }
 
-LZ3_FORCE_INLINE static constexpr LZ3_compress_flag operator^(LZ3_compress_flag lhs, LZ3_compress_flag rhs) 
+LZ3_FORCE_INLINE static constexpr LZ3_compress_flag operator^(LZ3_compress_flag lhs, LZ3_compress_flag rhs)
 {
-    return static_cast<LZ3_compress_flag>(static_cast<uint8_t>(lhs) ^ static_cast<uint8_t>(rhs));
+    return static_cast<LZ3_compress_flag>(static_cast<uint8_t>(lhs) & (~static_cast<uint8_t>(rhs)));
 }
 
 LZ3_FORCE_INLINE static constexpr bool operator&(LZ3_compress_flag lhs, LZ3_compress_flag rhs) 
@@ -576,6 +576,7 @@ struct LZ3_DCtx
         };
         struct
         {
+            LZ3_compress_flag flag;
             uint32_t blockLog;
             uint32_t lineSize;
             uint32_t of_base[64];
@@ -823,9 +824,9 @@ struct LZ3_decode_of_result
     size_t rax;
 };
 
-LZ3_FORCE_INLINE LZ3_decode_of_result LZ3_make_decode_of_result(uint32_t seqLen, uint32_t offset, uint32_t offShl = 0)
+LZ3_FORCE_INLINE LZ3_decode_of_result LZ3_make_decode_of_result(size_t seqLen, size_t offset)
 {
-    return { (((uint64_t)offset) << (32 + offShl)) | seqLen };
+    return { (offset << 32) | seqLen };
 }
 #else
 //use two reg to avoid shifting
@@ -845,9 +846,9 @@ struct LZ3_decode_of_result
     size_t rdx;
 };
 
-LZ3_FORCE_INLINE LZ3_decode_of_result LZ3_make_decode_of_result(uint32_t seqLen, uint32_t offset, uint32_t offShl = 0)
+LZ3_FORCE_INLINE LZ3_decode_of_result LZ3_make_decode_of_result(size_t seqLen, size_t offset)
 {
-    return { seqLen, offset << offShl };
+    return { seqLen, offset };
 }
 #endif
 
@@ -866,8 +867,7 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
             return LZ3_make_decode_of_result(1, dctx.preOff[1 + BIT_readBitsFast(&dctx.bitStr, 1)]);
         }
     }
-    uint32_t b = blockLog != 0 ? blockLog : dctx.blockLog;
-    uint32_t l = lineSize != 0 ? lineSize : dctx.lineSize;
+    uint32_t b = blockLog;
     if (flag & LZ3_compress_flag::OffsetBlock)
     {
         if (blockLog == 0)
@@ -875,12 +875,16 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
         if (c == 2)
         {
             uint32_t r = (uint32_t)BIT_readBitsFast(&dctx.bitStr, b);
-            auto result = LZ3_decode_of<blockLog, lineSize, flag ^ LZ3_compress_flag::OffsetBlock>(seqPtr, dctx);
-            return LZ3_make_decode_of_result((uint32_t)result.seqLen() + 1, (uint32_t)result.offset() - r);
+            constexpr LZ3_compress_flag subFlag = flag ^ (LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock);
+            auto result = LZ3_decode_of<0, lineSize, subFlag>(seqPtr, dctx);
+            return LZ3_make_decode_of_result(result.seqLen() + 1, (result.offset() << b) - r);
         }
     }
+    uint32_t l = lineSize;
     if (flag & LZ3_compress_flag::OffsetTwoDim)
     {
+        if (lineSize == 0)
+            l = dctx.lineSize;
         uint32_t e = *seqPtr++; //extended code record dy
         const uint32_t* dx_base = dctx.of_base;
         uint32_t x = dx_base[c];
@@ -895,7 +899,7 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
             y += (uint32_t)BIT_readBitsFast(&dctx.bitStr, dy_bits[e]);
         }
         uint32_t o = x + y * l + 1;
-        return LZ3_make_decode_of_result(2, o, b);
+        return LZ3_make_decode_of_result(2, o << b);
     }
     else
     {
@@ -904,7 +908,7 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
         {
             o += (uint32_t)BIT_readBitsFast(&dctx.bitStr, of_bits[c]);
         }
-        return LZ3_make_decode_of_result(1, o, b);
+        return LZ3_make_decode_of_result(1, o << b);
     }
 }
 
@@ -931,7 +935,6 @@ static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockL
         return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::None>;
     case 1:
         return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat>;
-        LZ3_UNREACHABLE;
     case 2:
         if (blockLog == 2)
             return &LZ3_decode_of_wrapper<2, 0, LZ3_compress_flag::OffsetBlock>;
@@ -939,7 +942,7 @@ static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockL
             return &LZ3_decode_of_wrapper<3, 0, LZ3_compress_flag::OffsetBlock>;
         if (blockLog == 4)
             return &LZ3_decode_of_wrapper<4, 0, LZ3_compress_flag::OffsetBlock>;
-        LZ3_UNREACHABLE;
+        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetBlock>;
     case 3:
         return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock>;
     case 4:
@@ -947,21 +950,43 @@ static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockL
     case 5:
         return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetTwoDim>;
     case 6:
+        if (blockLog == 3 && lineSize == 64)
+            return &LZ3_decode_of_wrapper<3, 64,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
         if (blockLog == 3 && lineSize == 128)
             return &LZ3_decode_of_wrapper<3, 128, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
         if (blockLog == 3 && lineSize == 256)
             return &LZ3_decode_of_wrapper<3, 256, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
-        if (blockLog == 4 && lineSize == 97)
-            return &LZ3_decode_of_wrapper<4, 97,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 3 && lineSize == 512)
+            return &LZ3_decode_of_wrapper<3, 512, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 43)
+            return &LZ3_decode_of_wrapper<4, 43,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 52)      
+            return &LZ3_decode_of_wrapper<4, 52,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 64)      
+            return &LZ3_decode_of_wrapper<4, 64,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 86)      
+            return &LZ3_decode_of_wrapper<4, 86,  LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 103)
+            return &LZ3_decode_of_wrapper<4, 103, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
         if (blockLog == 4 && lineSize == 128)
             return &LZ3_decode_of_wrapper<4, 128, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
         if (blockLog == 4 && lineSize == 171)
             return &LZ3_decode_of_wrapper<4, 171, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 205)
+            return &LZ3_decode_of_wrapper<4, 205, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
         if (blockLog == 4 && lineSize == 256)
             return &LZ3_decode_of_wrapper<4, 256, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 342)
+            return &LZ3_decode_of_wrapper<4, 342, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 410)
+            return &LZ3_decode_of_wrapper<4, 410, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        if (blockLog == 4 && lineSize == 512)
+            return &LZ3_decode_of_wrapper<4, 512, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
         return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+    case 7:
+        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat | LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
     default:
-        return &LZ3_decode_of_wrapper<0, 0, LZ3_compress_flag::OffsetRepeat |LZ3_compress_flag::OffsetBlock | LZ3_compress_flag::OffsetTwoDim>;
+        LZ3_UNREACHABLE;
     }
 }
 
@@ -1014,7 +1039,7 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, size_t srcSize, 
     }
 }
 
-static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, LZ3_entropy_coder coder)
+static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t*& dst, size_t dstCap, LZ3_entropy_coder coder)
 {
     size_t srcSize = LZ3_read_LE16(src);
     size_t oriSize;
@@ -1035,8 +1060,10 @@ static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t 
             LZ3_last_error_name = HUF_getErrorName(oriSize);
             return nullptr;
         }
+        const uint8_t* ptr = dst;
         src += srcSize;
-        return dst;
+        dst += oriSize;
+        return ptr;
     }
     else if (coder == LZ3_entropy_coder::FSE)
     {
@@ -1046,8 +1073,10 @@ static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t 
             LZ3_last_error_name = FSE_getErrorName(oriSize);
             return nullptr;
         }
+        const uint8_t* ptr = dst;
         src += srcSize;
-        return dst;
+        dst += oriSize;
+        return ptr;
     }
     else
     {
@@ -1458,11 +1487,27 @@ static vector<LZ3_match_info> LZ3_compress_opt(
 }
 
 template<LZ3_entropy_coder coder>
-static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, const uint8_t* src, uint8_t* dst, size_t srcSize)
+static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcSize, const uint32_t* params, LZ3_suffix_array* hsa, LZ3_suffix_array* tsa)
 {
     LZ3_CCtx cctx;
-    uint32_t hisSize = psa->n - (uint32_t)srcSize;
-    uint32_t srcPos = 0;
+	const LZ3_suffix_array* psa;
+    tsa->n = (uint32_t)srcSize;
+	tsa->cal_suffix_array(src, (uint32_t)srcSize);
+	tsa->cal_height(src, (uint32_t)srcSize);
+	uint32_t maxDistance = params[LZ3_compress_param::MaxMatchDistance];
+	if (hsa != nullptr)
+	{
+        if (hsa->n > maxDistance)
+        {
+            hsa->popn_suffix(hsa->n - maxDistance);
+        }
+        hsa->push_suffix(src - hsa->n, tsa);
+		psa = hsa;
+	}
+	else
+	{
+		psa = tsa;
+	}
 #if !defined(NDEBUG) && defined(LZ3_LOG_SA)
     ofstream sfs("LZ3_suffix_array.log");
     for (uint32_t i = 0; i < psa->n; ++i)
@@ -1495,6 +1540,8 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
         sfs << endl;
     }
 #endif
+    uint32_t hisSize = psa->n - (uint32_t)srcSize;
+    uint32_t srcPos = 0;
     if (coder == LZ3_entropy_coder::None)
     {
         auto lRawPrice = [](uint32_t v) { return 8 * LZ3_BIT_COST_MUL; };
@@ -1544,7 +1591,7 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
             cctx.params[LZ3_compress_param::MinFurtherOffset],
             lLenPrice, mLenPrice, mOffCluster, lRawPrice,
             nLenStats, nLenStats, mOffStats);
-        copy_n(par, LZ3_compress_param::Count, cctx.params);
+        copy_n(params, LZ3_compress_param::Count, cctx.params);
         vector<uint32_t> dict;
         for (auto i = freq.begin(); i != freq.end();)
         {
@@ -1677,7 +1724,7 @@ static size_t LZ3_compress_generic(uint32_t* par, const LZ3_suffix_array* psa, c
             cctx.params[LZ3_compress_param::MinFurtherOffset],
             lLenPrice, mLenPrice, mOffPrice1st, lRawPrice,
             lLenStats, mLenStats, mOffStats1st);
-        copy_n(par, LZ3_compress_param::Count, cctx.params);
+        copy_n(params, LZ3_compress_param::Count, cctx.params);
         //calc 2nd pass code hist
         cctx.flag = LZ3_detect_compress_flags(cctx);
         cctx.of_size = LZ3_gen_of_book(cctx.of_base, cctx.of_bits, cctx.flag, cctx.blockLog, cctx.lineSize);
@@ -1976,12 +2023,8 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     dfs << ",Literal,Match,Offset" << endl;
 #endif
     const uint8_t* srcPtr = src;
-    uint8_t* dstPtr = dst;
-    uint8_t* dstEnd = dstPtr + dstSize;
-    uint8_t* dstShortEnd = dstEnd - wild_copy_length;
 
     LZ3_DCtx dctx;
-    LZ3_compress_flag flag = LZ3_compress_flag::None;
     LZ3_of_decoder decodeOfWrapper = nullptr;
     uint8_t* buf = nullptr;
     const uint8_t* litPtr = nullptr;
@@ -1998,33 +2041,33 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     }
     else
     {
-        flag = (LZ3_compress_flag)*srcPtr++;
+        dctx.flag = (LZ3_compress_flag)*srcPtr++;
         dctx.blockLog = 0;
         dctx.lineSize = 0;
-        if (flag & LZ3_compress_flag::OffsetBlock)
+        if (dctx.flag & LZ3_compress_flag::OffsetBlock)
         {
             dctx.blockLog = *srcPtr++;
         }
-        if (flag & LZ3_compress_flag::OffsetTwoDim)
+        if (dctx.flag & LZ3_compress_flag::OffsetTwoDim)
         {
             dctx.lineSize = LZ3_read_LE16(srcPtr);
         }
-        dctx.of_size = LZ3_gen_of_book(dctx.of_base, dctx.of_bits, flag, dctx.blockLog, dctx.lineSize);
-        decodeOfWrapper = LZ3_gen_of_decoder(flag, dctx.blockLog, dctx.lineSize);
+        dctx.of_size = LZ3_gen_of_book(dctx.of_base, dctx.of_bits, dctx.flag, dctx.blockLog, dctx.lineSize);
+        decodeOfWrapper = LZ3_gen_of_decoder(dctx.flag, dctx.blockLog, dctx.lineSize);
         buf = new uint8_t[dstSize * 4];
         uint8_t* bufPtr = buf;
         litPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize, LZ3_entropy_coder::Huff0);
-        bufPtr += dstSize;
         llsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
-        bufPtr += dstSize;
         ofsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
-        bufPtr += dstSize;
         mlsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
         size_t bitSize = LZ3_read_LE16(srcPtr);
         BIT_initDStream(&dctx.bitStr, srcPtr, bitSize);
         srcPtr += bitSize;
         fill_n(dctx.preOff, 3, 0);
     }
+    uint8_t* dstPtr = dst;
+    uint8_t* dstEnd = dstPtr + dstSize;
+    uint8_t* dstShortEnd = dstEnd - wild_copy_length;
     while (true)
     {
         uint16_t token;
@@ -2216,92 +2259,80 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     return srcPtr - src;
 }
 
-uint32_t LZ3_compress(const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level)
+template<LZ3_entropy_coder coder>
+uint32_t LZ3_compress_continue_generic(LZ3_CStream* pcs, const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level);
+
+template<LZ3_entropy_coder coder>
+uint32_t LZ3_decompress_split_fast_generic(const void* src, void* dst, uint32_t dstSize);
+
+template<LZ3_entropy_coder coder>
+uint32_t LZ3_decompress_fast_continue_generic(LZ3_DStream* pds, const void* src, void* dst, uint32_t dstSize);
+
+template<LZ3_entropy_coder coder>
+uint32_t LZ3_compress_split_generic(const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level)
 {
     uint32_t dstPos;
     if (srcSize <= LZ3_MAX_BLOCK_SIZE)
     {
-        uint32_t par[LZ3_compress_param::Count];
-        LZ3_init_params(par, level, LZ3_entropy_coder::None);
+        uint32_t params[LZ3_compress_param::Count];
+        LZ3_init_params(params, level, coder);
         LZ3_suffix_array* psa = new LZ3_suffix_array(srcSize);
-        psa->cal_suffix_array((const uint8_t*)src, srcSize);
-        psa->cal_height((const uint8_t*)src, srcSize);
-        dstPos = (uint32_t)LZ3_compress_generic<LZ3_entropy_coder::None>(par, psa, (const uint8_t*)src, (uint8_t*)dst, srcSize);
+        dstPos = (uint32_t)LZ3_compress_generic<coder>((const uint8_t*)src, (uint8_t*)dst, srcSize, params, nullptr, psa);
         delete psa;
     }
     else
     {
         LZ3_CStream* pcs = LZ3_createCStream();
-        dstPos = LZ3_compress_continue(pcs, src, dst, srcSize, level);
+        dstPos = LZ3_compress_continue_generic<coder>(pcs, src, dst, srcSize, level);
         LZ3_freeCStream(pcs);
     }
-    vector<uint8_t> test(srcSize);
-    assert(LZ3_decompress_fast(dst, test.data(), srcSize) == dstPos);
+#if !defined(NDEBUG) && defined(LZ3_CHK_DEC)
+    vector<uint8_t> buf(srcSize);
+    size_t chkPos = LZ3_decompress_split_fast_generic<coder>(dst, buf.data(), srcSize);
+    assert(chkPos == dstPos);
     for (size_t i = 0; i < srcSize; ++i)
     {
-        assert(test[i] == ((const uint8_t*)src)[i]);
+        assert(buf[i] == ((const uint8_t*)src)[i]);
     }
+#endif
     return dstPos;
+}
+
+template<LZ3_entropy_coder coder>
+uint32_t LZ3_decompress_split_fast_generic(const void* src, void* dst, uint32_t dstSize)
+{
+    uint32_t srcPos;
+    if (dstSize < LZ3_MAX_BLOCK_SIZE)
+    {
+        srcPos = (uint32_t)LZ3_decompress_generic<coder, LZ3_history_pos::Prefix>((const uint8_t*)src, (uint8_t*)dst, dstSize, 0, nullptr, 0);
+    }
+    else
+    {
+        LZ3_DStream* pds = LZ3_createDStream();
+        srcPos = LZ3_decompress_fast_continue_generic<coder>(pds, src, dst, dstSize);
+        LZ3_freeDStream(pds);
+    }
+    return srcPos;
+}
+
+uint32_t LZ3_compress(const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level)
+{
+    return LZ3_compress_split_generic<LZ3_entropy_coder::None>(src, dst, srcSize, level);
 }
 
 uint32_t LZ3_decompress_fast(const void* src, void* dst, uint32_t dstSize)
 {
-    uint32_t srcPos;
-    if (dstSize < LZ3_MAX_BLOCK_SIZE)
-    {
-        srcPos = (uint32_t)LZ3_decompress_generic<LZ3_entropy_coder::None, LZ3_history_pos::Prefix>((const uint8_t*)src, (uint8_t*)dst, dstSize, 0, nullptr, 0);
-    }
-    else
-    {
-        LZ3_DStream* pds = LZ3_createDStream();
-        srcPos = LZ3_decompress_fast_continue(pds, src, dst, dstSize);
-        LZ3_freeDStream(pds);
-    }
-    return srcPos;
+    return LZ3_decompress_split_fast_generic<LZ3_entropy_coder::None>(src, dst, dstSize);
 }
 
 uint32_t LZ3_compress_HUF(const void* src, void* dst, uint32_t srcSize, LZ3_CLevel level)
 {
-    uint32_t dstPos;
-    if (srcSize <= LZ3_MAX_BLOCK_SIZE)
-    {
-        uint32_t par[LZ3_compress_param::Count];
-        LZ3_init_params(par, level, LZ3_entropy_coder::Huff0);
-        LZ3_suffix_array* psa = new LZ3_suffix_array(srcSize);
-        psa->cal_suffix_array((const uint8_t*)src, srcSize);
-        psa->cal_height((const uint8_t*)src, srcSize);
-        dstPos = (uint32_t)LZ3_compress_generic<LZ3_entropy_coder::Huff0>(par, psa, (const uint8_t*)src, (uint8_t*)dst, srcSize);
-        delete psa;
-    }
-    else
-    {
-        LZ3_CStream* pcs = LZ3_createCStream();
-        dstPos = LZ3_compress_HUF_continue(pcs, src, dst, srcSize, level);
-        LZ3_freeCStream(pcs);
-    }
-    vector<uint8_t> test(srcSize);
-    assert(LZ3_decompress_HUF_fast(dst, test.data(), srcSize) == dstPos);
-    for (size_t i = 0; i < srcSize; ++i)
-    {
-        assert(test[i] == ((const uint8_t*)src)[i]);
-    }
-    return dstPos;
+    return LZ3_compress_split_generic<LZ3_entropy_coder::Huff0>(src, dst, srcSize, level);
 }
 
 uint32_t LZ3_decompress_HUF_fast(const void* src, void* dst, uint32_t dstSize)
 {
-    uint32_t srcPos;
-    if (dstSize < LZ3_MAX_BLOCK_SIZE)
-    {
-        srcPos = (uint32_t)LZ3_decompress_generic<LZ3_entropy_coder::Huff0, LZ3_history_pos::Prefix>((const uint8_t*)src, (uint8_t*)dst, dstSize, 0, nullptr, 0);
-    }
-    else
-    {
-        LZ3_DStream* pds = LZ3_createDStream();
-        srcPos = LZ3_decompress_HUF_fast_continue(pds, src, dst, dstSize);
-        LZ3_freeDStream(pds);
-    }
-    return srcPos;
+    return LZ3_decompress_split_fast_generic<LZ3_entropy_coder::Huff0>(src, dst, dstSize);
 }
 
 struct LZ3_CStream
@@ -2326,25 +2357,17 @@ uint32_t LZ3_compress_continue_generic(LZ3_CStream* pcs, const void* src, void* 
     while (srcPtr < srcEnd)
     {
         uint32_t curSize = min((uint32_t)(srcEnd - srcPtr), LZ3_MAX_BLOCK_SIZE);
-        uint32_t par[LZ3_compress_param::Count];
-        LZ3_init_params(par, level, coder);
-        uint32_t max_distance = par[LZ3_compress_param::MaxMatchDistance];
-        pcs->tsa.n = curSize;
-        pcs->tsa.cal_suffix_array(srcPtr, curSize);
-        pcs->tsa.cal_height(srcPtr, curSize);
+        uint32_t params[LZ3_compress_param::Count];
+        LZ3_init_params(params, level, coder);
+        uint32_t maxDistance = params[LZ3_compress_param::MaxMatchDistance];
         if (pcs->psz + curSize > pcs->sz + sizeof(pcs->sz))
         {
-            memcpy(pcs->sz, pcs->psz - max_distance, max_distance);
-            pcs->psz = pcs->sz + max_distance;
+            memcpy(pcs->sz, pcs->psz - maxDistance, maxDistance);
+            pcs->psz = pcs->sz + maxDistance;
         }
         memcpy(pcs->psz, srcPtr, curSize);
         srcPtr += curSize;
-        if (pcs->hsa.n > max_distance)
-        {
-            pcs->hsa.popn_suffix(pcs->hsa.n - max_distance);
-        }
-        pcs->hsa.push_suffix(pcs->psz - pcs->hsa.n, &pcs->tsa);
-        dstPtr += LZ3_compress_generic<coder>(par, &pcs->hsa, pcs->psz, dstPtr, curSize);
+        dstPtr += LZ3_compress_generic<coder>(pcs->psz, dstPtr, curSize, params, &pcs->hsa, &pcs->tsa);
         pcs->psz += curSize;
     }
     return (uint32_t)(dstPtr - (uint8_t*)dst);
