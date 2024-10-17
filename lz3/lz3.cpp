@@ -1176,24 +1176,24 @@ LZ3_FORCE_INLINE static uint32_t LZ3_weight(uint32_t freq)
 class LZ3_code_hist
 {
     uint32_t freq[256];
-    uint32_t total;
+    uint32_t sum;
     uint32_t base;
 
 public:
     LZ3_code_hist() :
-        freq{ 0 }, total(0), base(0)
+        freq{ 0 }, sum(0), base(0)
     {
     }
 
     void inc_stats(uint8_t code, uint32_t inc = 1)
     {
         freq[code] += inc;
-        total += inc;
+        sum += inc;
     }
 
     void eval_base()
     {
-        base = LZ3_weight(total);
+        base = LZ3_weight(sum);
     }
 
     uint32_t eval_bits(uint8_t code)
@@ -1204,7 +1204,7 @@ public:
     void clear()
     {
         fill_n(freq, 256, 0);
-        total = 0;
+        sum = 0;
         base = 0;
     }
 };
@@ -1355,13 +1355,13 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
 }
 
 template<
-    typename LLenPrice, typename MLenPrice, typename MOffPrice, typename LRawPrice,
-    typename LLenStats, typename MLenStats, typename MOffStats>
+    typename LRawPrice, typename LLenPrice, typename MLenPrice, typename MOffPrice,
+    typename LRawStats, typename LLenStats, typename MLenStats, typename MOffStats>
 static vector<LZ3_match_info> LZ3_compress_opt(
     const LZ3_suffix_array* psa, const uint8_t* src, size_t srcSize,
     uint32_t max_distance, uint32_t sufficient_length, uint32_t match_count, uint32_t further_offset,
-    LLenPrice lLenPrice, MLenPrice mLenPrice, MOffPrice mOffPrice, LRawPrice lRawPrice,
-    LLenStats lLenStats, MLenStats mLenStats, MOffStats mOffStats)
+    LRawPrice lRawPrice, LLenPrice lLenPrice, MLenPrice mLenPrice, MOffPrice mOffPrice,
+    LRawStats lRawStats, LLenStats lLenStats, MLenStats mLenStats, MOffStats mOffStats)
 {
     uint32_t hisSize = psa->n - (uint32_t)srcSize;
     uint32_t srcPos = hisSize;
@@ -1526,6 +1526,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
             }
             for (auto m = reverse.rbegin(); m != reverse.rend(); ++m)
             {
+                lRawStats(src + srcPos - hisSize, m->literal);
                 srcPos += m->literal;
                 uint32_t preOff[3] = { 0 };
                 for (uint32_t p = 0; p < 3 && p < matches.size(); ++p)
@@ -1607,6 +1608,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
     if (coder == LZ3_entropy_coder::None)
     {
         auto lRawPrice = [](uint32_t v) { return 8 * LZ3_BIT_COST_MUL; };
+        auto nRawStats = [](const uint8_t* r, uint32_t l) {};
         auto lLenPrice = [](uint32_t v)
         {
             if (v < 15)
@@ -1631,7 +1633,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             }
         };
         unordered_map<uint32_t, uint32_t> freq;
-        auto mOffCluster = [&freq](uint32_t v, uint32_t p[3])
+        auto mOffPrice1st = [&freq](uint32_t v, uint32_t p[3])
         {
             auto o = freq.find(v);
             if (o != freq.end())
@@ -1651,8 +1653,8 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             cctx.params[LZ3_compress_param::SufficientMatchLength],
             cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
-            lLenPrice, mLenPrice, mOffCluster, lRawPrice,
-            nLenStats, nLenStats, mOffStats);
+            lRawPrice, lLenPrice, mLenPrice, mOffPrice1st,
+            nRawStats, nLenStats, nLenStats, mOffStats);
         copy_n(params, LZ3_compress_param::Count, cctx.params);
         vector<uint32_t> dict;
         for (auto i = freq.begin(); i != freq.end();)
@@ -1683,7 +1685,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
                 freq.erase(offset);
             }
         }
-        auto mOffPrice = [&freq](uint32_t v, uint32_t p[3])
+        auto mOffPrice2nd = [&freq](uint32_t v, uint32_t p[3])
         {
             auto o = freq.find(v);
             if (o != freq.end())
@@ -1701,16 +1703,16 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             cctx.params[LZ3_compress_param::SufficientMatchLength],
             cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
-            lLenPrice, mLenPrice, mOffPrice, lRawPrice,
-            nLenStats, nLenStats, nOffStats);
+            lRawPrice, lLenPrice, mLenPrice, mOffPrice2nd,
+            nRawStats, nLenStats, nLenStats, nOffStats);
     }
     else
     {
         //init 1st pass code hist
         LZ3_code_hist lRawHist;
-        for (uint32_t i = 0; i < srcSize; ++i)
+        for (uint32_t i = 0; i < 255; ++i)
         {
-            lRawHist.inc_stats(src[i]);
+            lRawHist.inc_stats((uint8_t)i);
         }
         LZ3_code_hist lLenHist;
         static constexpr uint32_t baseLLFreqs[LZ3_MAX_LL + 1] = {
@@ -1742,6 +1744,14 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         auto lRawPrice = [&lRawHist](uint8_t v)
         { 
             return lRawHist.eval_bits(v);
+        };
+        auto lRawStats = [&lRawHist](const uint8_t* r, uint32_t l)
+        {
+            for (uint32_t i = 0; i < l; ++i)
+            {
+                lRawHist.inc_stats(r[i]);
+            }
+            lRawHist.eval_base();
         };
         auto lLenPrice = [&lLenHist](uint32_t v)
         {
@@ -1784,23 +1794,16 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             cctx.params[LZ3_compress_param::SufficientMatchLength],
             cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
-            lLenPrice, mLenPrice, mOffPrice1st, lRawPrice,
-            lLenStats, mLenStats, mOffStats1st);
+            lRawPrice, lLenPrice, mLenPrice, mOffPrice1st,
+            lRawStats, lLenStats, mLenStats, mOffStats1st);
         copy_n(params, LZ3_compress_param::Count, cctx.params);
         //calc 2nd pass code hist
         cctx.flag = LZ3_detect_compress_flags(cctx);
         cctx.of_size = LZ3_gen_of_book(cctx.of_base, cctx.of_bits, cctx.flag, cctx.blockLog, cctx.lineSize);
         fill_n(cctx.preOff, 3, 0);
-        lRawHist.clear();
         mOffHist.clear();
-        srcPos = 0;
         for (const LZ3_match_info& match : cctx.matches)
         {
-            uint32_t position = match.position - hisSize;
-            for (uint32_t i = srcPos; i < position; ++i)
-            {
-                lRawHist.inc_stats(src[i]);
-            }
             uint32_t offset = match.offset;
             LZ3_encode_of_result results[3];
             uint32_t count = LZ3_encode_of(offset, results, cctx.flag, cctx.preOff, cctx.blockLog, cctx.lineSize, cctx.of_base, cctx.of_bits);
@@ -1812,16 +1815,9 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             cctx.preOff[2] = cctx.preOff[1];
             cctx.preOff[1] = cctx.preOff[0];
             cctx.preOff[0] = offset;
-            srcPos = position + match.length;
         }
-        {
-            for (uint32_t i = srcPos; i < srcSize; ++i)
-            {
-                lRawHist.inc_stats(src[i]);
-            }
-        }
-        lRawHist.eval_base();
         mOffHist.eval_base();
+        auto nRawStats = [&lRawHist](const uint8_t* r, uint32_t l) {};
         auto mOffPrice2nd = [&mOffHist, &cctx](uint32_t offset, uint32_t preOff[3])
         {
             LZ3_encode_of_result results[3];
@@ -1850,8 +1846,8 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             cctx.params[LZ3_compress_param::SufficientMatchLength],
             cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
-            lLenPrice, mLenPrice, mOffPrice2nd, lRawPrice,
-            lLenStats, mLenStats, mOffStats2nd);
+            lRawPrice, lLenPrice, mLenPrice, mOffPrice2nd,
+            nRawStats, lLenStats, mLenStats, mOffStats2nd);
     }
 #if !defined(NDEBUG) && defined(LZ3_LOG_SEQ)
     static uint32_t ci;
