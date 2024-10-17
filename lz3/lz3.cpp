@@ -338,6 +338,16 @@ enum class LZ3_compress_flag : uint8_t
     OffsetTwoDim = 4,
 };
 
+enum class LZ3_stream_flag : uint8_t
+{
+    None,
+    EndOfStream = 1,
+    RawBytes    = 2,
+    BoundedBits = 4,
+    Huff0       = 8,
+    FSE         = 16,
+};
+
 enum class LZ3_history_pos
 {
     Prefix,
@@ -441,6 +451,7 @@ static uint8_t LZ3_ml_code(uint32_t value)
 }
 
 #define LZ3_MIN_OF 3u
+#define LZ3_MAX_OF 42u
 
 static uint32_t of_base[] = {
     0,        1,        0,
@@ -992,96 +1003,162 @@ static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockL
 
 static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, size_t srcSize, LZ3_entropy_coder coder, uint32_t uncompressIntercept, uint32_t uncompressThreshold)
 {
-    size_t dstSize = 0;
-    if (coder == LZ3_entropy_coder::Huff0)
+    uint8_t* flag = nullptr;
+    size_t remainSize = srcSize;
+    while (remainSize > 0)
     {
-        dstSize = HUF_compress(&dst[sizeof(uint16_t) * 2], HUF_compressBound(srcSize), src, srcSize);
-        if (HUF_isError(dstSize))
+        flag = dst++;
+        *flag = (uint8_t)LZ3_stream_flag::None;
+        size_t rSize = min(remainSize, (size_t)0x10000);
+        uint8_t codeMax = 0;
+        for (size_t i = 0; i < rSize; ++i)
         {
-            LZ3_last_error_name = HUF_getErrorName(dstSize);
-            return;
+            codeMax = max(codeMax, src[i]);
         }
-    }
-    if (coder == LZ3_entropy_coder::FSE)
-    {
-        dstSize = FSE_compress(&dst[sizeof(uint16_t) * 1], FSE_compressBound(srcSize), src, srcSize);
-        if (dstSize == 1)
+        uint8_t nbBits = LZ3_HIGH_BIT_32(max(codeMax, (uint8_t)1)) + 1;
+        size_t bSize = (nbBits * rSize + 3 + 1 + 7) / 8;
+        do
         {
-            dstSize = 0;
+            if (coder == LZ3_entropy_coder::FSE)
+            {
+                size_t fSize = FSE_compress(dst + sizeof(uint16_t), FSE_compressBound(srcSize), src, srcSize);
+                if (!FSE_isError(fSize) && fSize > 1 && fSize < bSize && fSize + uncompressIntercept < rSize * uncompressThreshold / 100)
+                {
+                    *flag |= (uint8_t)LZ3_stream_flag::FSE;
+                    LZ3_write_LE16(dst, (uint16_t)(fSize - 1));
+                    src += rSize;
+                    dst += fSize;
+                    break;;
+                }
+            }
+            if (coder >= LZ3_entropy_coder::Huff0)
+            {
+                size_t hSize = HUF_compress(dst + sizeof(uint16_t) * 2, HUF_compressBound(srcSize), src, srcSize);
+                if (!HUF_isError(hSize) && hSize > 0 && hSize < bSize && hSize + uncompressIntercept < rSize * uncompressThreshold / 100)
+                {
+                    *flag |= (uint8_t)LZ3_stream_flag::Huff0;
+                    LZ3_write_LE16(dst, (uint16_t)(hSize - 1));
+                    LZ3_write_LE16(dst, (uint16_t)(rSize - 1));
+                    src += rSize;
+                    dst += hSize;
+                    break;
+                }
+            }
+            if (bSize + uncompressIntercept < rSize * uncompressThreshold / 100)
+            {
+                *flag |= (uint8_t)LZ3_stream_flag::BoundedBits;
+                BIT_CStream_t bitStr;
+                BIT_initCStream(&bitStr, dst + sizeof(uint16_t), rSize + 1 + sizeof(size_t));
+                for (const uint8_t* b = src + rSize - 1; b >= src; --b)
+                {
+                    BIT_addBitsFast(&bitStr, *b, nbBits);
+                    BIT_flushBits(&bitStr);
+                }
+                BIT_addBitsFast(&bitStr, nbBits, 3);
+                size_t cSize = BIT_closeCStream(&bitStr);
+                assert(cSize == bSize);
+                LZ3_write_LE16(dst, (uint16_t)(cSize - 1));
+                src += rSize;
+                dst += cSize;
+            }
+            else
+            {
+                *flag |= (uint8_t)LZ3_stream_flag::RawBytes;
+                LZ3_write_LE16(dst, (uint16_t)(rSize - 1));
+                memcpy(dst, src, rSize);
+                src += rSize;
+                dst += rSize;
+            }
         }
-        if (FSE_isError(dstSize))
-        {
-            LZ3_last_error_name = FSE_getErrorName(dstSize);
-            return;
-        }
+        while (false);
+        remainSize -= rSize;
     }
-    if (dstSize + uncompressIntercept > srcSize * uncompressThreshold / 100)
+    if (flag != nullptr)
     {
-        dstSize = 0;
-    }
-    if (dstSize == 0)
-    {
-        LZ3_write_LE16(dst, (uint16_t)dstSize);
-        LZ3_write_LE16(dst, (uint16_t)srcSize);
-        memcpy(dst, src, srcSize);
-        dst += srcSize;
-    }
-    else if (coder == LZ3_entropy_coder::Huff0)
-    {
-        LZ3_write_LE16(dst, (uint16_t)dstSize);
-        LZ3_write_LE16(dst, (uint16_t)srcSize);
-        dst += dstSize;
-    }
-    else if (coder == LZ3_entropy_coder::FSE)
-    {
-        LZ3_write_LE16(dst, (uint16_t)dstSize);
-        dst += dstSize;
-    }
-}
-
-static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t*& dst, size_t dstCap, LZ3_entropy_coder coder)
-{
-    size_t srcSize = LZ3_read_LE16(src);
-    size_t oriSize;
-    if (srcSize == 0)
-    {
-        oriSize = LZ3_read_LE16(src);
-        const uint8_t* raw = src;
-        src += oriSize;
-        return raw;
-    }
-    else if (coder == LZ3_entropy_coder::Huff0)
-    {
-        oriSize = LZ3_read_LE16(src);
-        dst += dstCap - oriSize;
-        oriSize = HUF_decompress(dst, oriSize, src, srcSize);
-        if (HUF_isError(oriSize))
-        {
-            LZ3_last_error_name = HUF_getErrorName(oriSize);
-            return nullptr;
-        }
-        const uint8_t* ptr = dst;
-        src += srcSize;
-        dst += oriSize;
-        return ptr;
-    }
-    else if (coder == LZ3_entropy_coder::FSE)
-    {
-        oriSize = FSE_decompress(dst, dstCap, src, srcSize);
-        if (FSE_isError(oriSize))
-        {
-            LZ3_last_error_name = FSE_getErrorName(oriSize);
-            return nullptr;
-        }
-        const uint8_t* ptr = dst;
-        src += srcSize;
-        dst += oriSize;
-        return ptr;
+        *flag |= (uint8_t)LZ3_stream_flag::EndOfStream;
     }
     else
     {
-        return nullptr;
+        *dst++ = (uint8_t)LZ3_stream_flag::EndOfStream;
     }
+}
+
+static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t*& dst, size_t dstCap)
+{
+    const uint8_t* ptr = dst;
+    size_t refSize = 0;
+    while (true)
+    {
+        uint8_t flag = *src++;
+        do
+        {
+            if (refSize > 0)
+            {
+                memcpy(dst, ptr, refSize);
+                ptr = dst;
+                dst += refSize;
+            }
+            if (flag & (uint8_t)LZ3_stream_flag::FSE)
+            {
+                size_t fSize = LZ3_read_LE16(src) + 1;
+                size_t rSize = FSE_decompress(dst, dstCap, src, fSize);
+                if (FSE_isError(rSize))
+                {
+                    LZ3_last_error_name = FSE_getErrorName(rSize);
+                    return nullptr;
+                }
+                src += fSize;
+                dst += rSize;
+                dstCap -= rSize;
+                break;
+            }
+            if (flag & (uint8_t)LZ3_stream_flag::Huff0)
+            {
+                size_t hSize = LZ3_read_LE16(src) + 1;
+                size_t rSize = LZ3_read_LE16(src) + 1;
+                rSize = HUF_decompress(dst, rSize, src, hSize);
+                if (HUF_isError(rSize))
+                {
+                    LZ3_last_error_name = HUF_getErrorName(rSize);
+                    return nullptr;
+                }
+                src += hSize;
+                dst += rSize;
+                dstCap -= rSize;
+                break;
+            }
+            if (flag & (uint8_t)LZ3_stream_flag::BoundedBits)
+            {
+                size_t cSize = LZ3_read_LE16(src) + 1;
+                BIT_DStream_t bitStr;
+                BIT_initDStream(&bitStr, src, cSize);
+                uint8_t nbBit = (uint8_t)BIT_readBitsFast(&bitStr, 3);
+                while (!BIT_endOfDStream(&bitStr))
+                {
+                    *dst++ = (uint8_t)BIT_readBitsFast(&bitStr, nbBit);
+                    BIT_reloadDStream(&bitStr);
+                }
+                src += cSize;
+                break;
+            }
+            if (flag & (uint8_t)LZ3_stream_flag::RawBytes)
+            {
+                size_t rSize = LZ3_read_LE16(src) + 1;
+                memcpy(dst, src, rSize);
+                ptr = src;
+                refSize = rSize;
+                src += rSize;
+                dst += rSize;
+                break;
+            }
+        }
+        while (false);
+        if (flag & (uint8_t)LZ3_stream_flag::EndOfStream)
+        {
+            break;
+        }
+    }
+    return ptr;
 }
 
 #define LZ3_BIT_COST_ACC 8u
@@ -1221,7 +1298,7 @@ static LZ3_compress_flag LZ3_detect_compress_flags(LZ3_CCtx& cctx)
             continue;
         }
         divisor >>= cctx.blockLog;
-        if (divisor < 16 || divisor > numeric_limits<uint16_t>::max())
+        if (divisor < 16 || divisor > 4092)
         {
             continue;
         }
@@ -1902,10 +1979,10 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         }
         uint32_t uci = cctx.params[LZ3_compress_param::UncompressIntercept];
         uint32_t uct = cctx.params[LZ3_compress_param::UncompressThreshold];
-        LZ3_write_stream(dstPtr, lit.data(), (uint32_t)lit.size(), LZ3_entropy_coder::Huff0, uci, uct);
-        LZ3_write_stream(dstPtr, lls.data(), (uint32_t)lls.size(), coder, uci, uct);
-        LZ3_write_stream(dstPtr, ofs.data(), (uint32_t)ofs.size(), coder, uci, uct);
-        LZ3_write_stream(dstPtr, mls.data(), (uint32_t)mls.size(), coder, uci, uct);
+        LZ3_write_stream(dstPtr, lit.data(), lit.size(), LZ3_entropy_coder::Huff0, uci, uct);
+        LZ3_write_stream(dstPtr, lls.data(), lls.size(), coder, uci, uct);
+        LZ3_write_stream(dstPtr, ofs.data(), ofs.size(), coder, uci, uct);
+        LZ3_write_stream(dstPtr, mls.data(), mls.size(), coder, uci, uct);
         BIT_CStream_t bitStr;
         BIT_initCStream(&bitStr, dstPtr + sizeof(uint16_t), ext.size() * 2/*15bit*/ + 1 + sizeof(size_t));
         for (size_t i = ext.size(); i > 0; --i)
@@ -2041,10 +2118,10 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         decodeOfWrapper = LZ3_gen_of_decoder(dctx.flag, dctx.blockLog, dctx.lineSize);
         buf = new uint8_t[dstSize * 4];
         uint8_t* bufPtr = buf;
-        litPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize, LZ3_entropy_coder::Huff0);
-        llsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
-        ofsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
-        mlsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize, coder);
+        litPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
+        llsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
+        ofsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
+        mlsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
         size_t bitSize = LZ3_read_LE16(srcPtr);
         BIT_initDStream(&dctx.bitStr, srcPtr, bitSize);
         srcPtr += bitSize;
