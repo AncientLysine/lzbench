@@ -1364,7 +1364,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
     LLenStats lLenStats, MLenStats mLenStats, MOffStats mOffStats)
 {
     uint32_t hisSize = psa->n - (uint32_t)srcSize;
-    uint32_t srcPos = 0;
+    uint32_t srcPos = hisSize;
     vector<LZ3_match_info> matches;
     vector<LZ3_match_optm> optimal;
     vector<LZ3_match_optm> reverse;
