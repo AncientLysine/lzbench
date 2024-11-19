@@ -17,6 +17,10 @@
 #define FSE_STATIC_LINKING_ONLY
 #include "zstd/lib/common/fse.h"
 
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
+#include <arm_neon.h>
+#endif
+
 #if !defined(NDEBUG) && (defined(LZ3_LOG_SA) || defined(LZ3_LOG_SEQ))
 #include <sstream>
 #include <fstream>
@@ -865,10 +869,13 @@ LZ3_FORCE_INLINE static LZ3_decode_of_result LZ3_decode_of(const uint8_t* seqPtr
 }
 
 template<uint32_t blockLog, uint32_t lineSize, LZ3_compress_flag flag>
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD) && defined(__aarch64__)
+__attribute__((aarch64_vector_pcs))
+#endif
 static LZ3_decode_of_result LZ3_decode_of_wrapper(const uint8_t* seqPtr, LZ3_DCtx& dctx)
 {
     auto result = LZ3_decode_of<blockLog, lineSize, flag>(seqPtr, dctx);
-    if (flag & LZ3_compress_flag::OffsetRepeat)
+    if LZ3_CONSTEXPRIF(flag & LZ3_compress_flag::OffsetRepeat)
     {
         dctx.preOff[2] = dctx.preOff[1];
         dctx.preOff[1] = dctx.preOff[0];
@@ -877,6 +884,9 @@ static LZ3_decode_of_result LZ3_decode_of_wrapper(const uint8_t* seqPtr, LZ3_DCt
     return result;
 }
 
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD) && defined(__aarch64__)
+__attribute__((aarch64_vector_pcs))
+#endif
 typedef LZ3_decode_of_result(*LZ3_of_decoder)(const uint8_t* seqPtr, LZ3_DCtx& dctx);
 
 static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockLog, uint32_t lineSize)
@@ -1173,7 +1183,7 @@ struct LZ3_chunk_fse
     }
 };
 
-constexpr uint8_t merge_idx[][16] =
+static constexpr uint8_t merge_idx[][16] =
 {
     { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
     { 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 },
@@ -1661,7 +1671,7 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
             }
             if (!chunkFallback && chunk.estimate_size() + uncompressIntercept < chunk.fallback_size() * uncompressThreshold / 100)
             {
-                if LZ3_CONSTEXPRIF(chunk.coder() == LZ3_entropy_coder::FSE)
+                if LZ3_CONSTEXPRIF(ChunkType::coder() == LZ3_entropy_coder::FSE)
                 {
                     size_t cSize = FSE_compress_usingCTable(
                         dst + sizeof(uint16_t), FSE_compressBound(rSize),
@@ -1685,7 +1695,7 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
                         break;
                     }
                 }
-                if LZ3_CONSTEXPRIF(chunk.coder() == LZ3_entropy_coder::Huff0)
+                if LZ3_CONSTEXPRIF(ChunkType::coder() == LZ3_entropy_coder::Huff0)
                 {
                     size_t cSize = HUF_compress4X_usingCTable(
                         dst + sizeof(uint16_t) * 2, HUF_compressBound(rSize),
@@ -2411,6 +2421,9 @@ LZ3_FORCE_INLINE static void LZ3_wild_copy(uint8_t* dst, uint8_t* dstEnd, const 
 }
 
 template<size_t length>
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD) && defined(__aarch64__)
+__attribute__((aarch64_vector_pcs))
+#endif
 static void LZ3_safe_copy(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, const uint8_t* src)
 {
     if (dstEnd <= dstShortEnd)
@@ -2431,6 +2444,9 @@ static void LZ3_safe_copy(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, c
 }
 
 template<size_t length>
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD) && defined(__aarch64__)
+__attribute__((aarch64_vector_pcs))
+#endif
 static void LZ3_safe_move(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, const uint8_t* src)
 {
     if (dst + 8 > dstEnd)
@@ -2470,6 +2486,96 @@ static void LZ3_safe_move(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, c
 
 static constexpr uint32_t wild_copy_length = 16;
 
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
+static constexpr uint8_t periodic_seq[] = {
+    0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF,
+    0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF,
+};
+
+static constexpr uint8_t periodic_inc[] = {
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
+};
+
+LZ3_FORCE_INLINE static uint8x16x4_t LZ3_reload8x4x16(const uint8_t* lrsPtr, uint16x8x2_t& lbsPosVec, uint8x16_t& lbsBufOff)
+{
+    uint8x16x4_t lbsBufVec;
+    lbsPosVec.val[0] = vaddw_u8(lbsPosVec.val[0], vget_low_u8(lbsBufOff));
+    uint32x4_t pos = vmovl_u16(vget_low_u16(lbsPosVec.val[0]));
+    uint32x4_t vld = vdupq_n_u32(0);
+    uint64x2_t poz = vreinterpretq_u64_u32(pos);
+    uint64_t po0 = vgetq_lane_u64(poz, 0);
+    uint64_t po1 = vgetq_lane_u64(poz, 1);
+    vld = vld1q_lane_u32(lrsPtr + (po0 & 0xFFFF), vld, 0);
+    vld = vld1q_lane_u32(lrsPtr + (po0 >> 32),    vld, 1);
+    vld = vld1q_lane_u32(lrsPtr + (po1 & 0xFFFF), vld, 2);
+    vld = vld1q_lane_u32(lrsPtr + (po1 >> 32),    vld, 3);
+    lbsBufVec.val[0] = vreinterpretq_u8_u32(vld);
+    pos = vmovl_high_u16(lbsPosVec.val[0]);
+    poz = vreinterpretq_u64_u32(pos);
+    po0 = vgetq_lane_u64(poz, 0);
+    po1 = vgetq_lane_u64(poz, 1);
+    vld = vld1q_lane_u32(lrsPtr + (po0 & 0xFFFF), vld, 0);
+    vld = vld1q_lane_u32(lrsPtr + (po0 >> 32),    vld, 1);
+    vld = vld1q_lane_u32(lrsPtr + (po1 & 0xFFFF), vld, 2);
+    vld = vld1q_lane_u32(lrsPtr + (po1 >> 32),    vld, 3);
+    lbsBufVec.val[1] = vreinterpretq_u8_u32(vld);
+    lbsPosVec.val[1] = vaddw_high_u8(lbsPosVec.val[1], lbsBufOff);
+    pos = vmovl_u16(vget_low_u16(lbsPosVec.val[1]));
+    poz = vreinterpretq_u64_u32(pos);
+    po0 = vgetq_lane_u64(poz, 0);
+    po1 = vgetq_lane_u64(poz, 1);
+    vld = vld1q_lane_u32(lrsPtr + (po0 & 0xFFFF), vld, 0);
+    vld = vld1q_lane_u32(lrsPtr + (po0 >> 32),    vld, 1);
+    vld = vld1q_lane_u32(lrsPtr + (po1 & 0xFFFF), vld, 2);
+    vld = vld1q_lane_u32(lrsPtr + (po1 >> 32),    vld, 3);
+    lbsBufVec.val[2] = vreinterpretq_u8_u32(vld);
+    pos = vmovl_high_u16(lbsPosVec.val[1]);
+    poz = vreinterpretq_u64_u32(pos);
+    po0 = vgetq_lane_u64(poz, 0);
+    po1 = vgetq_lane_u64(poz, 1);
+    vld = vld1q_lane_u32(lrsPtr + (po0 & 0xFFFF), vld, 0);
+    vld = vld1q_lane_u32(lrsPtr + (po0 >> 32),    vld, 1);
+    vld = vld1q_lane_u32(lrsPtr + (po1 & 0xFFFF), vld, 2);
+    vld = vld1q_lane_u32(lrsPtr + (po1 >> 32),    vld, 3);
+    lbsBufVec.val[3] = vreinterpretq_u8_u32(vld);
+    lbsBufOff = vdupq_n_u8(0);
+    return lbsBufVec;
+}
+
+#endif
+
 template<LZ3_entropy_coder coder, LZ3_history_pos hisPos>
 static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t dstSize, size_t preSize, const uint8_t* ext, size_t extSize)
 {
@@ -2489,8 +2595,8 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     LZ3_DCtx dctx;
     LZ3_of_decoder decodeOfWrapper = nullptr;
     uint8_t* buf = nullptr;
-    const uint8_t* lrsPtr = nullptr;
-    const uint8_t* lbsPtr[16] = { nullptr };
+    const uint8_t* lrsPtr = nullptr; //literal raw stream
+    uint16_t lbsPos[16] = { 0 }; //literal block stream current position
     const uint8_t* llsPtr = nullptr;
     const uint8_t* ofsPtr = nullptr;
     const uint8_t* mlsPtr = nullptr;
@@ -2523,9 +2629,13 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         {
             size_t pieces[16] = { 0 };
             size_t count = LZ3_read_stream(srcPtr, bufPtr, dstSize, pieces);
-            for (size_t i = 0; i < count; ++i)
+            assert(count == 16);
+            (void)count;
+            lrsPtr = bufPtr;
+            for (uint32_t i = 0; i < 16; ++i)
             {
-                lbsPtr[(merge_idx[dctx.blockLog][i] + (uintptr_t)dst) % 16] = bufPtr;
+                uintptr_t lbsIdx = (merge_idx[dctx.blockLog][i] + (uintptr_t)dst) % 16;
+                lbsPos[lbsIdx] = (uint16_t)(bufPtr - lrsPtr);
                 bufPtr += pieces[i];
             }
         }
@@ -2544,6 +2654,21 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     uint8_t* dstPtr = dst;
     uint8_t* dstEnd = dstPtr + dstSize;
     uint8_t* dstShortEnd = dstEnd - wild_copy_length;
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
+    uint16x8x2_t lbsPosVec; //literal block stream current position
+    uint8x16x4_t lbsBufVec; //literal block stream buffer
+    uint8x16_t lbsBufOff; //literal block stream buffer offset
+    uint32_t lbsBufCnt; //literal block stream buffer read count
+    if (coder != LZ3_entropy_coder::None)
+    {
+        if (dctx.flag & LZ3_compress_flag::LiteralBlock)
+        {
+            lbsPosVec = vld1q_u16_x2(lbsPos);
+            lbsBufOff = vdupq_n_u8(0);
+            lbsBufCnt = 0;
+        }
+    }
+#endif
     while (true)
     {
         uint16_t token;
@@ -2578,13 +2703,31 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             }
             else
             {
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
+                if (literal > 0)
+                {
+                    uint8x16_t seq = vld1q_u8(periodic_seq + (size_t)dstPtr % 16);
+                    if (lbsBufCnt == 0)
+                    {
+                        lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
+                        lbsBufCnt = 4;
+                    }
+                    uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
+                    uint8x16_t idx = vsliq_n_u8(off, seq, 2);
+                    uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
+                    vst1q_u8(dstPtr, top);
+                    uint8x16_t inc = vld1q_u8(periodic_inc + literal * 32 - (size_t)dstPtr % 16);
+                    lbsBufOff = vaddq_u8(lbsBufOff, inc);
+                    lbsBufCnt--;
+                }
+#else
                 uint8_t* cpyPtr = dstPtr;
                 uint8_t* cpyEnd = dstPtr + literal;
                 while (cpyPtr < cpyEnd)
                 {
-                    const uint8_t*& litPtr = lbsPtr[(uintptr_t)cpyPtr % 16];
-                    *cpyPtr++ = *litPtr++;
+                    *cpyPtr++ = lrsPtr[lbsPos[(uintptr_t)cpyPtr % 16]++];
                 }
+#endif
             }
             dstPtr += literal;
         }
@@ -2620,12 +2763,46 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             }
             else
             {
+#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
+                uint8x16_t seq = vld1q_u8(periodic_seq + (size_t)dstPtr % 16);
+                while (literal >= 16)
+                {
+                    if (lbsBufCnt == 0)
+                    {
+                        lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
+                        lbsBufCnt = 4;
+                    }
+                    uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
+                    uint8x16_t idx = vsliq_n_u8(off, seq, 2);
+                    uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
+                    vst1q_u8(dstPtr, top);
+                    dstPtr += 16;
+                    lbsBufOff = vaddq_u8(lbsBufOff, vdupq_n_u8(1));
+                    lbsBufCnt--;
+                    literal -= 16;
+                }
+                if (literal > 0)
+                {
+                    if (lbsBufCnt == 0)
+                    {
+                        lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
+                        lbsBufCnt = 4;
+                    }
+                    uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
+                    uint8x16_t idx = vsliq_n_u8(off, seq, 2);
+                    uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
+                    vst1q_u8(dstPtr, top);
+                    uint8x16_t inc = vld1q_u8(periodic_inc + literal * 32 - (size_t)dstPtr % 16);
+                    lbsBufOff = vaddq_u8(lbsBufOff, inc);
+                    lbsBufCnt--;
+                }
+#else
                 uint8_t* cpyPtr = dstPtr;
                 while (cpyPtr < cpyEnd)
                 {
-                    const uint8_t*& litPtr = lbsPtr[(uintptr_t)cpyPtr % 16];
-                    *cpyPtr++ = *litPtr++;
+                    *cpyPtr++ = lrsPtr[lbsPos[(uintptr_t)cpyPtr % 16]++];
                 }
+#endif
             }
             dstPtr += literal;
             if (dstPtr >= dstEnd)
