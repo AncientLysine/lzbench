@@ -1298,6 +1298,7 @@ static LZ3_compress_flag LZ3_detect_offset_flags(const vector<LZ3_match_info>& m
     int64_t bestPrice = codePrice;
     //consider only block of 3(RGB24), 4(RGB32), 8(ETC1), 16(ETC2/ASTC) bytes
     cctx.blockSize = 0;
+    cctx.blockLog = 0;
     int64_t blk2Thres = bestPrice * cctx.params[LZ3_compress_param::OffBlockModeThreshold] / 100 - cctx.params[LZ3_compress_param::OffBlockModeIntercept] * 8 * LZ3_BIT_COST_MUL;
     static constexpr uint32_t usualBlockSize[] = { 3, 4, 8, 16 };
     for (uint32_t divisor : usualBlockSize)
@@ -1342,7 +1343,7 @@ static LZ3_compress_flag LZ3_detect_offset_flags(const vector<LZ3_match_info>& m
     {
         uint32_t divisor = origList[i].first;
         LZ3_compress_flag newFlag = LZ3_compress_flag::OffsetTwoDim;
-        if (cctx.blockSize != 0)
+        if (cctx.blockSize > 1)
         {
             newFlag = newFlag | LZ3_compress_flag::OffsetBlock;
             if (divisor % cctx.blockSize)
@@ -1420,15 +1421,12 @@ static LZ3_compress_flag LZ3_detect_offset_flags(const vector<LZ3_match_info>& m
 static LZ3_compress_flag LZ3_detect_literal_flags(const LZ3_code_hist& lRawHist, const LZ3_code_hist lBlkHist[16], LZ3_CCtx& cctx, vector<LZ3_chunk_huf>* chunks = nullptr)
 {
     LZ3_compress_flag flag = LZ3_compress_flag::None;
-    uint64_t bestSize = lRawHist.size();
+    LZ3_chunk_huf lHufChunk(lRawHist, (uint8_t)255);
+    if (chunks != nullptr) *chunks = { lHufChunk };
+    uint64_t bestSize = min(lHufChunk.estimate_size(), lHufChunk.fallback_size());
+    if (!(cctx.flag & LZ3_compress_flag::OffsetBlock))
     {
-        LZ3_chunk_huf lHufChunk(lRawHist, (uint8_t)255);
-        uint64_t lHufSize = lHufChunk.estimate_size();
-        if (lHufSize + cctx.params[LZ3_compress_param::LitUncompressIntercept] < bestSize * cctx.params[LZ3_compress_param::LitUncompressThreshold] / 100)
-        {
-            bestSize = lHufSize;
-            if (chunks != nullptr) chunks->push_back(lHufChunk);
-        }
+        return flag;
     }
     do
     {
@@ -2348,7 +2346,10 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             for (uint32_t i = srcPos; i < position; ++i)
             {
                 lrs.push_back(src[i]);
-                lbs[i % 16].push_back(src[i]);
+                if (cctx.flag & LZ3_compress_flag::OffsetBlock)
+                {
+                    lbs[i % 16].push_back(src[i]);
+                }
             }
             uint32_t literal = (uint32_t)(position - srcPos);
             uint32_t length = match.length;
@@ -2364,30 +2365,37 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             for (uint32_t i = srcPos; i < srcSize; ++i)
             {
                 lrs.push_back(src[i]);
-                lbs[i % 16].push_back(src[i]);
+                if (cctx.flag & LZ3_compress_flag::OffsetBlock)
+                {
+                    lbs[i % 16].push_back(src[i]);
+                }
             }
             uint32_t literal = (uint32_t)(srcSize - srcPos);
             LZ3_encode_ll(lls, ext, literal);
         }
         LZ3_code_hist lRawHist;
         LZ3_code_hist lBlkHist[16];
-        vector<size_t> pieces;
-        vector<LZ3_chunk_huf> chunks;
-        for (uint32_t i = 0; i < 16; ++i)
+        for (uint8_t l : lrs)
         {
-            uint32_t idx = merge_idx[cctx.blockLog][i];
-            for (uint8_t l : lbs[idx])
-            {
-                lms.push_back(l);
-                lBlkHist[i].inc_stats(l);
-            }
-            lRawHist.merge(lBlkHist[i]);
-            pieces.push_back(lBlkHist[i].size());
+            lRawHist.inc_stats(l);
         }
+        if (cctx.flag & LZ3_compress_flag::OffsetBlock)
+        {
+            for (uint32_t i = 0; i < 16; ++i)
+            {
+                uint32_t idx = merge_idx[cctx.blockLog][i];
+                for (uint8_t l : lbs[idx])
+                {
+                    lms.push_back(l);
+                    lBlkHist[i].inc_stats(l);
+                }
+            }
+        }
+        vector<LZ3_chunk_huf> chunks;
         cctx.flag = cctx.flag | LZ3_detect_literal_flags(lRawHist, lBlkHist, cctx, &chunks);
         uint8_t* dstPtr = dst;
         *dstPtr++ = (uint8_t)cctx.flag;
-        if (cctx.flag & LZ3_compress_flag::OffsetBlock || cctx.flag & LZ3_compress_flag::LiteralBlock)
+        if (cctx.flag & LZ3_compress_flag::OffsetBlock)
         {
             if (cctx.blockSize == (1u << cctx.blockLog))
             {
@@ -2407,6 +2415,11 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         uint32_t lut = cctx.params[LZ3_compress_param::LitUncompressThreshold];
         if (cctx.flag & LZ3_compress_flag::LiteralBlock)
         {
+            vector<size_t> pieces;
+            for (uint32_t i = 0; i < 16; ++i)
+            {
+                pieces.push_back(lBlkHist[i].size());
+            }
             LZ3_write_stream<LZ3_chunk_huf>(dstPtr, lms.data(), pieces, chunks, lui, lut);
         }
         else
@@ -2639,7 +2652,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         dctx.blockSize = 0;
         dctx.blockLog = 0;
         dctx.lineSize = 0;
-        if (dctx.flag & LZ3_compress_flag::OffsetBlock || dctx.flag & LZ3_compress_flag::LiteralBlock)
+        if (dctx.flag & LZ3_compress_flag::OffsetBlock)
         {
             dctx.blockLog = *srcPtr++;
             if (dctx.blockLog != 0)
@@ -2760,7 +2773,8 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
                 uint8_t* cpyEnd = dstPtr + literal;
                 while (cpyPtr < cpyEnd)
                 {
-                    *cpyPtr++ = lrsPtr[lbsPos[(uintptr_t)cpyPtr % 16]++];
+                    uint16_t litPos = lbsPos[(uintptr_t)cpyPtr % 16]++;
+                    *cpyPtr++ = lrsPtr[litPos];
                 }
 #endif
             }
@@ -2835,7 +2849,8 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
                 uint8_t* cpyPtr = dstPtr;
                 while (cpyPtr < cpyEnd)
                 {
-                    *cpyPtr++ = lrsPtr[lbsPos[(uintptr_t)cpyPtr % 16]++];
+                    uint16_t litPos = lbsPos[(uintptr_t)cpyPtr % 16]++;
+                    *cpyPtr++ = lrsPtr[litPos];
                 }
 #endif
             }
