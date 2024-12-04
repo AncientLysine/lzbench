@@ -314,6 +314,8 @@ enum LZ3_compress_param
     OffDim2ModeIntercept,
     LitBlockModeThreshold,
     LitBlockModeIntercept,
+    LitPredictModeThreshold,
+    LitPredictModeIntercept,
     LitUncompressThreshold,
     LitUncompressIntercept,
     SeqUncompressThreshold,
@@ -323,16 +325,16 @@ enum LZ3_compress_param
 
 static uint32_t default_params[LZ3_CLevel::LZ3_CLevel_Max + 1][LZ3_compress_param::Count] =
 {
-    { 0x7FFF,  128,  1,   0,  100, 0, 100, 0, 105, 0, 100, 0, 98,  0, 98,  0 },
-    { 0x7FFF,  128,  2,   0,  100, 0, 100, 0, 105, 0, 100, 0, 98,  0, 98,  0 }, //CLevel_Min
-    { 0x7FFF,  128,  4,   0,  100, 0, 100, 0, 105, 0, 100, 0, 98,  0, 98,  0 },
-    { 0x7FFF,  128,  8,   0,  100, 0, 100, 0, 105, 0, 100, 0, 98,  0, 98,  0 }, //CLevel_Fast
-    { 0xFFFF,  172,  16,  1,  100, 0, 100, 0, 105, 0, 100, 0, 98,  0, 98,  0 },
-    { 0xFFFF,  172,  32,  1,  100, 0, 100, 0, 105, 0, 100, 0, 99,  0, 99,  0 }, //CLevel_Normal
-    { 0xFFFF,  172,  64,  2,  100, 0, 100, 0, 105, 0, 100, 0, 99,  0, 99,  0 },
-    { 0x17FFF, 256,  128, 4,  100, 0, 100, 0, 105, 0, 100, 0, 99,  0, 99,  0 }, //CLevel_Optimal
-    { 0x17FFF, 256,  256, 16, 100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 100, 0 },
-    { 0x1FFFE, 384,  512, 64, 100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 100, 0 }, //CLevel_MAX
+    { 0x7FFF,  128,  1,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
+    { 0x7FFF,  128,  2,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 }, //CLevel_Min
+    { 0x7FFF,  128,  4,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
+    { 0x7FFF,  128,  8,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 }, //CLevel_Fast
+    { 0xFFFF,  172,  16,  1,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
+    { 0xFFFF,  172,  32,  1,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 }, //CLevel_Normal
+    { 0xFFFF,  172,  64,  2,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 },
+    { 0x17FFF, 256,  128, 4,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 }, //CLevel_Optimal
+    { 0x17FFF, 256,  256, 16, 100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 100, 0, 100, 0 },
+    { 0x1FFFE, 384,  512, 64, 100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 100, 0, 100, 0 }, //CLevel_MAX
 };
 
 enum class LZ3_entropy_coder
@@ -345,10 +347,11 @@ enum class LZ3_entropy_coder
 enum class LZ3_compress_flag : uint8_t
 {
     None,
-    OffsetRepeat = 1,
-    OffsetBlock  = 2,
-    OffsetTwoDim = 4,
-    LiteralBlock = 8,
+    OffsetRepeat   = 1,
+    OffsetBlock    = 2,
+    OffsetTwoDim   = 4,
+    LiteralBlock   = 8,
+    LiteralPredict = 16,
 };
 
 enum class LZ3_stream_flag : uint8_t
@@ -1418,7 +1421,7 @@ static LZ3_compress_flag LZ3_detect_offset_flags(const vector<LZ3_match_info>& m
     return flag;
 }
 
-static LZ3_compress_flag LZ3_detect_literal_flags(const LZ3_code_hist& lRawHist, const LZ3_code_hist lBlkHist[16], LZ3_CCtx& cctx, vector<LZ3_chunk_huf>* chunks = nullptr)
+static LZ3_compress_flag LZ3_detect_literal_flags(const LZ3_code_hist& lRawHist, const LZ3_code_hist lBlkHist[16], const LZ3_code_hist& lPreHist, LZ3_CCtx& cctx, vector<LZ3_chunk_huf>* chunks = nullptr)
 {
     LZ3_compress_flag flag = LZ3_compress_flag::None;
     LZ3_chunk_huf lHufChunk(lRawHist, (uint8_t)255);
@@ -1427,6 +1430,16 @@ static LZ3_compress_flag LZ3_detect_literal_flags(const LZ3_code_hist& lRawHist,
     if (!(cctx.flag & LZ3_compress_flag::OffsetBlock))
     {
         return flag;
+    }
+    {
+        LZ3_chunk_huf lPrdChunk(lPreHist, (uint8_t)255);
+        uint64_t lPrdSize = lPrdChunk.estimate_size();
+        if (lPrdSize + cctx.params[LZ3_compress_param::LitPredictModeIntercept] < bestSize * cctx.params[LZ3_compress_param::LitPredictModeThreshold] / 100)
+        {
+            flag = LZ3_compress_flag::LiteralPredict;
+            bestSize = lPrdSize;
+            if (chunks != nullptr) *chunks = { lPrdChunk };
+        }
     }
     do
     {
@@ -2329,6 +2342,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
     {
         vector<uint8_t> lrs;
         vector<uint8_t> lbs[16];
+        vector<uint8_t> lps;
         vector<uint8_t> lms;
         vector<uint8_t> lls;
         vector<uint8_t> ofs;
@@ -2345,10 +2359,14 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             }
             for (uint32_t i = srcPos; i < position; ++i)
             {
-                lrs.push_back(src[i]);
+                uint8_t l = src[i];
+                lrs.push_back(l);
                 if (cctx.flag & LZ3_compress_flag::OffsetBlock)
                 {
-                    lbs[i % 16].push_back(src[i]);
+                    lbs[i % 16].push_back(l);
+                    if (i >= cctx.blockSize)
+                        l -= src[i - cctx.blockSize];
+                    lps.push_back(l);
                 }
             }
             uint32_t literal = (uint32_t)(position - srcPos);
@@ -2364,10 +2382,14 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         {
             for (uint32_t i = srcPos; i < srcSize; ++i)
             {
-                lrs.push_back(src[i]);
+                uint8_t l = src[i];
+                lrs.push_back(l);
                 if (cctx.flag & LZ3_compress_flag::OffsetBlock)
                 {
-                    lbs[i % 16].push_back(src[i]);
+                    lbs[i % 16].push_back(l);
+                    if (i >= cctx.blockSize)
+                        l -= src[i - cctx.blockSize];
+                    lps.push_back(l);
                 }
             }
             uint32_t literal = (uint32_t)(srcSize - srcPos);
@@ -2375,6 +2397,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         }
         LZ3_code_hist lRawHist;
         LZ3_code_hist lBlkHist[16];
+        LZ3_code_hist lPrdHist;
         for (uint8_t l : lrs)
         {
             lRawHist.inc_stats(l);
@@ -2390,9 +2413,13 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
                     lBlkHist[i].inc_stats(l);
                 }
             }
+            for (uint8_t l : lps)
+            {
+                lPrdHist.inc_stats(l);
+            }
         }
         vector<LZ3_chunk_huf> chunks;
-        cctx.flag = cctx.flag | LZ3_detect_literal_flags(lRawHist, lBlkHist, cctx, &chunks);
+        cctx.flag = cctx.flag | LZ3_detect_literal_flags(lRawHist, lBlkHist, lPrdHist, cctx, &chunks);
         uint8_t* dstPtr = dst;
         *dstPtr++ = (uint8_t)cctx.flag;
         if (cctx.flag & LZ3_compress_flag::OffsetBlock)
@@ -2413,19 +2440,30 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         }
         uint32_t lui = cctx.params[LZ3_compress_param::LitUncompressIntercept];
         uint32_t lut = cctx.params[LZ3_compress_param::LitUncompressThreshold];
-        if (cctx.flag & LZ3_compress_flag::LiteralBlock)
+        do
         {
             vector<size_t> pieces;
-            for (uint32_t i = 0; i < 16; ++i)
+            if (cctx.flag & LZ3_compress_flag::LiteralBlock)
             {
-                pieces.push_back(lBlkHist[i].size());
+                for (uint32_t i = 0; i < 16; ++i)
+                {
+                    pieces.push_back(lBlkHist[i].size());
+                }
+                LZ3_write_stream<LZ3_chunk_huf>(dstPtr, lms.data(), pieces, chunks, lui, lut);
+                break;
             }
-            LZ3_write_stream<LZ3_chunk_huf>(dstPtr, lms.data(), pieces, chunks, lui, lut);
+            if (cctx.flag & LZ3_compress_flag::LiteralPredict)
+            {
+                pieces.push_back(lps.size());
+                LZ3_write_stream<LZ3_chunk_huf>(dstPtr, lps.data(), pieces, chunks, lui, lut);
+                break;
+            }
+            {
+                pieces.push_back(lrs.size());
+                LZ3_write_stream<LZ3_chunk_huf>(dstPtr, lrs.data(), pieces, chunks, lui, lut);
+            }
         }
-        else
-        {
-            LZ3_write_stream(dstPtr, lrs.data(), lrs.size(), LZ3_entropy_coder::Huff0, lui, lut);
-        }
+        while (false);
         uint32_t sui = cctx.params[LZ3_compress_param::SeqUncompressIntercept];
         uint32_t sut = cctx.params[LZ3_compress_param::SeqUncompressThreshold];
         LZ3_write_stream(dstPtr, lls.data(), lls.size(), coder, sui, sut);
@@ -2744,39 +2782,55 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
                 memcpy(dstPtr, srcPtr, wild_copy_length);
                 srcPtr += literal;
             }
-            else if (!(dctx.flag & LZ3_compress_flag::LiteralBlock))
-            {
-                memcpy(dstPtr, lrsPtr, wild_copy_length);
-                lrsPtr += literal;
-            }
             else
             {
+                if (dctx.flag & LZ3_compress_flag::LiteralBlock)
+                {
 #if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
-                if (literal > 0)
-                {
-                    uint8x16_t seq = vld1q_u8(periodic_seq + (size_t)dstPtr % 16);
-                    if (lbsBufCnt == 0)
+                    if (literal > 0)
                     {
-                        lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
-                        lbsBufCnt = 4;
+                        uint8x16_t seq = vld1q_u8(periodic_seq + (size_t)dstPtr % 16);
+                        if (lbsBufCnt == 0)
+                        {
+                            lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
+                            lbsBufCnt = 4;
+                        }
+                        uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
+                        uint8x16_t idx = vsliq_n_u8(off, seq, 2);
+                        uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
+                        vst1q_u8(dstPtr, top);
+                        uint8x16_t inc = vld1q_u8(periodic_inc + literal * 32 - (size_t)dstPtr % 16);
+                        lbsBufOff = vaddq_u8(lbsBufOff, inc);
+                        lbsBufCnt--;
                     }
-                    uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
-                    uint8x16_t idx = vsliq_n_u8(off, seq, 2);
-                    uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
-                    vst1q_u8(dstPtr, top);
-                    uint8x16_t inc = vld1q_u8(periodic_inc + literal * 32 - (size_t)dstPtr % 16);
-                    lbsBufOff = vaddq_u8(lbsBufOff, inc);
-                    lbsBufCnt--;
-                }
 #else
-                uint8_t* cpyPtr = dstPtr;
-                uint8_t* cpyEnd = dstPtr + literal;
-                while (cpyPtr < cpyEnd)
-                {
-                    uint16_t litPos = lbsPos[(uintptr_t)cpyPtr % 16]++;
-                    *cpyPtr++ = lrsPtr[litPos];
-                }
+                    uint8_t* cpyPtr = dstPtr;
+                    uint8_t* cpyEnd = dstPtr + literal;
+                    while (cpyPtr < cpyEnd)
+                    {
+                        uint16_t litPos = lbsPos[(uintptr_t)cpyPtr % 16]++;
+                        *cpyPtr++ = lrsPtr[litPos];
+                    }
 #endif
+                }
+                else
+                {
+                    memcpy(dstPtr, lrsPtr, wild_copy_length);
+                    lrsPtr += literal;
+                }
+                if (dctx.flag & LZ3_compress_flag::LiteralPredict)
+                {
+                    uint8_t* cpyPtr = dstPtr;
+                    uint8_t* cpyEnd = dstPtr + literal;
+                    while (cpyPtr < cpyEnd)
+                    {
+                        if (cpyPtr >= dst + dctx.blockSize)
+                        {
+                            *cpyPtr += *(cpyPtr - dctx.blockSize);
+                        }
+                        cpyPtr++;
+                    }
+                }
             }
             dstPtr += literal;
         }
@@ -2805,54 +2859,69 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
                 LZ3_safe_copy<wild_copy_length>(dstPtr, cpyEnd, dstShortEnd, srcPtr);
                 srcPtr += literal;
             }
-            else if (!(dctx.flag & LZ3_compress_flag::LiteralBlock))
-            {
-                LZ3_safe_copy<wild_copy_length>(dstPtr, cpyEnd, dstShortEnd, lrsPtr);
-                lrsPtr += literal;
-            }
             else
             {
+                if (dctx.flag & LZ3_compress_flag::LiteralBlock)
+                {
 #if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
-                uint8x16_t seq = vld1q_u8(periodic_seq + (size_t)dstPtr % 16);
-                while (literal >= 16)
-                {
-                    if (lbsBufCnt == 0)
+                    uint8x16_t seq = vld1q_u8(periodic_seq + (size_t)dstPtr % 16);
+                    while (literal >= 16)
                     {
-                        lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
-                        lbsBufCnt = 4;
+                        if (lbsBufCnt == 0)
+                        {
+                            lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
+                            lbsBufCnt = 4;
+                        }
+                        uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
+                        uint8x16_t idx = vsliq_n_u8(off, seq, 2);
+                        uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
+                        vst1q_u8(dstPtr, top);
+                        dstPtr += 16;
+                        lbsBufOff = vaddq_u8(lbsBufOff, vdupq_n_u8(1));
+                        lbsBufCnt--;
+                        literal -= 16;
                     }
-                    uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
-                    uint8x16_t idx = vsliq_n_u8(off, seq, 2);
-                    uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
-                    vst1q_u8(dstPtr, top);
-                    dstPtr += 16;
-                    lbsBufOff = vaddq_u8(lbsBufOff, vdupq_n_u8(1));
-                    lbsBufCnt--;
-                    literal -= 16;
-                }
-                if (literal > 0)
-                {
-                    if (lbsBufCnt == 0)
+                    if (literal > 0)
                     {
-                        lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
-                        lbsBufCnt = 4;
+                        if (lbsBufCnt == 0)
+                        {
+                            lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
+                            lbsBufCnt = 4;
+                        }
+                        uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
+                        uint8x16_t idx = vsliq_n_u8(off, seq, 2);
+                        uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
+                        vst1q_u8(dstPtr, top);
+                        uint8x16_t inc = vld1q_u8(periodic_inc + literal * 32 - (size_t)dstPtr % 16);
+                        lbsBufOff = vaddq_u8(lbsBufOff, inc);
+                        lbsBufCnt--;
                     }
-                    uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
-                    uint8x16_t idx = vsliq_n_u8(off, seq, 2);
-                    uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
-                    vst1q_u8(dstPtr, top);
-                    uint8x16_t inc = vld1q_u8(periodic_inc + literal * 32 - (size_t)dstPtr % 16);
-                    lbsBufOff = vaddq_u8(lbsBufOff, inc);
-                    lbsBufCnt--;
-                }
 #else
-                uint8_t* cpyPtr = dstPtr;
-                while (cpyPtr < cpyEnd)
-                {
-                    uint16_t litPos = lbsPos[(uintptr_t)cpyPtr % 16]++;
-                    *cpyPtr++ = lrsPtr[litPos];
-                }
+                    uint8_t* cpyPtr = dstPtr;
+                    while (cpyPtr < cpyEnd)
+                    {
+                        uint16_t litPos = lbsPos[(uintptr_t)cpyPtr % 16]++;
+                        *cpyPtr++ = lrsPtr[litPos];
+                    }
 #endif
+                }
+                else
+                {
+                    LZ3_safe_copy<wild_copy_length>(dstPtr, cpyEnd, dstShortEnd, lrsPtr);
+                    lrsPtr += literal;
+                }
+                if (dctx.flag & LZ3_compress_flag::LiteralPredict)
+                {
+                    uint8_t* cpyPtr = dstPtr;
+                    while (cpyPtr < cpyEnd)
+                    {
+                        if (cpyPtr >= dst + dctx.blockSize)
+                        {
+                            *cpyPtr += *(cpyPtr - dctx.blockSize);
+                        }
+                        cpyPtr++;
+                    }
+                }
             }
             dstPtr += literal;
             if (dstPtr >= dstEnd)
