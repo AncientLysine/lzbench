@@ -363,7 +363,7 @@ enum class LZ3_stream_flag : uint8_t
     RunLength   = 8,
     Huff0       = 16,
     FSE         = 32,
-    NewHeader   = 64,
+    MergedPiece = 64,
 };
 
 enum class LZ3_history_pos
@@ -1795,80 +1795,74 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
     size_t chunkIdx = 0;
     size_t pieceSize = pieces.empty() ? 0 : pieces[0];
     size_t chunkSize = chunks.empty() ? 0 : chunks[0].codeHist.size();
-    size_t compressSize = 0;
-    size_t fallbackSize = 0;
-    bool headerWritten = false;
-    bool chunkFallback = false;
+    size_t rSize = 0;
     while (pieceSize > 0 || chunkSize > 0)
     {
         *(flag = dst++) = (uint8_t)LZ3_stream_flag::None;
-        size_t rSize = min(pieceSize, chunkSize);
-        assert(rSize <= numeric_limits<uint16_t>::max());
+        size_t pSize = min(pieceSize, chunkSize);
+        assert(pSize <= numeric_limits<uint16_t>::max());
+        rSize += pSize;
         const ChunkType& chunk = chunks[chunkIdx];
         do
         {
+            if (chunkSize > pieceSize)
+            {
+                *flag |= (uint8_t)LZ3_stream_flag::MergedPiece;
+                LZ3_write_LE16(dst, (uint16_t)pSize);
+                break;
+            }
             size_t bSize = (rSize * chunk.codeBits + 3 + 1 + 7) / 8;
             if (chunk.hSize == 1 && chunk.cSize == 0)
             {
                 *flag |= (uint8_t)LZ3_stream_flag::RunLength;
-                LZ3_write_LE16(dst, (uint16_t)rSize);
+                LZ3_write_LE16(dst, (uint16_t)pSize);
                 *dst = chunk.header[0];
                 src += rSize;
                 dst += 1;
-                compressSize += 4;
-                fallbackSize += 4;
+                rSize = 0;
                 break;
             }
-            if (!chunkFallback && chunk.estimate_size() + uncompressIntercept < chunk.fallback_size() * uncompressThreshold / 100)
+            if (chunk.estimate_size() + uncompressIntercept < chunk.fallback_size() * uncompressThreshold / 100)
             {
                 if LZ3_CONSTEXPRIF(ChunkType::coder() == LZ3_entropy_coder::FSE)
                 {
                     size_t cSize = FSE_compress_usingCTable(
-                        dst + sizeof(uint16_t), FSE_compressBound(rSize),
+                        dst + sizeof(uint16_t) + chunk.hSize, FSE_compressBound(rSize),
                         src, rSize, (const FSE_CTable*)chunk.table);
-                    if (!FSE_isError(cSize) && cSize > 0 && 3 + cSize < 3 + min(rSize, bSize))
+                    if (!FSE_isError(cSize) && cSize > 0)
                     {
-                        *flag |= (uint8_t)LZ3_stream_flag::FSE;
-                        LZ3_write_LE16(dst, (uint16_t)cSize);
-                        src += rSize;
-                        dst += cSize;
-                        compressSize += 3 + cSize;
-                        fallbackSize += 3 + min(rSize, bSize);
-                        if (!headerWritten)
+                        cSize += chunk.hSize;
+                        if (3 + cSize < 3 + min(rSize, bSize))
                         {
-                            *flag |= (uint8_t)LZ3_stream_flag::NewHeader;
+                            *flag |= (uint8_t)LZ3_stream_flag::FSE;
+                            LZ3_write_LE16(dst, (uint16_t)cSize);
                             memcpy(dst, chunk.header, chunk.hSize);
-                            dst += chunk.hSize;
-                            compressSize += chunk.hSize;
-                            headerWritten = true;
+                            src += rSize;
+                            dst += cSize;
+                            rSize = 0;
+                            break;
                         }
-                        break;
                     }
                 }
                 if LZ3_CONSTEXPRIF(ChunkType::coder() == LZ3_entropy_coder::Huff0)
                 {
-                    //TODO by Lysine: merge pieces to save 4X bit stream offset
                     size_t cSize = HUF_compress4X_usingCTable(
-                        dst + sizeof(uint16_t) * 2, HUF_compressBound(rSize),
+                        dst + sizeof(uint16_t) * 2 + chunk.hSize, HUF_compressBound(rSize),
                         src, rSize, (const HUF_CElt*)chunk.table);
-                    if (!HUF_isError(cSize) && cSize > 0 && 5 + cSize < 3 + min(rSize, bSize))
+                    if (!HUF_isError(cSize) && cSize > 0)
                     {
-                        *flag |= (uint8_t)LZ3_stream_flag::Huff0;
-                        LZ3_write_LE16(dst, (uint16_t)cSize);
-                        LZ3_write_LE16(dst, (uint16_t)rSize);
-                        src += rSize;
-                        dst += cSize;
-                        compressSize += 5 + cSize;
-                        fallbackSize += 3 + min(rSize, bSize);
-                        if (!headerWritten)
+                        cSize += chunk.hSize;
+                        if (5 + cSize < 3 + min(rSize, bSize))
                         {
-                            *flag |= (uint8_t)LZ3_stream_flag::NewHeader;
+                            *flag |= (uint8_t)LZ3_stream_flag::Huff0;
+                            LZ3_write_LE16(dst, (uint16_t)cSize);
+                            LZ3_write_LE16(dst, (uint16_t)pSize);
                             memcpy(dst, chunk.header, chunk.hSize);
-                            dst += chunk.hSize;
-                            compressSize += chunk.hSize;
-                            headerWritten = true;
+                            src += rSize;
+                            dst += cSize;
+                            rSize = 0;
+                            break;
                         }
-                        break;
                     }
                 }
             }
@@ -1888,35 +1882,21 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
                 LZ3_write_LE16(dst, (uint16_t)cSize);
                 src += rSize;
                 dst += cSize;
-                compressSize += 3 + cSize;
-                fallbackSize += 3 + bSize;
+                rSize = 0;
             }
             else
             {
                 *flag |= (uint8_t)LZ3_stream_flag::RawBytes;
-                LZ3_write_LE16(dst, (uint16_t)rSize);
+                LZ3_write_LE16(dst, (uint16_t)pSize);
                 memcpy(dst, src, rSize);
                 src += rSize;
                 dst += rSize;
-                compressSize += 3 + rSize;
-                fallbackSize += 3 + rSize;
+                rSize = 0;
             }
         }
         while (false);
-        pieceSize -= rSize;
-        chunkSize -= rSize;
-        if (chunkSize == 0 && headerWritten && compressSize >= fallbackSize)
-        {
-            chunkSize = chunks[chunkIdx].codeHist.size();
-            for (pieceSize += chunkSize; pieceSize > pieces[pieceIdx] || (pieceSize == pieces[pieceIdx] && pieceIdx > 0 && pieces[pieceIdx - 1] == 0); pieceSize -= pieces[pieceIdx--]);
-            src -= chunkSize;
-            dst -= compressSize;
-            headerWritten = false;
-            chunkFallback = true;
-            compressSize = 0;
-            fallbackSize = 0;
-            continue;
-        }
+        pieceSize -= pSize;
+        chunkSize -= pSize;
         if (pieceSize == 0 && pieceIdx < pieces.size() - 1)
         {
             pieceSize = pieces[++pieceIdx];
@@ -1924,10 +1904,6 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
         if (chunkSize == 0 && chunkIdx < chunks.size() - 1)
         {
             chunkSize = chunks[++chunkIdx].codeHist.size();
-            headerWritten = false;
-            chunkFallback = false;
-            compressSize = 0;
-            fallbackSize = 0;
         }
     }
     if (flag != nullptr)
@@ -1961,24 +1937,29 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, size_t srcSize, 
 
 const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, size_t* pieces)
 {
-    uint32_t wksp[HUF_DECOMPRESS_WORKSPACE_SIZE_U32];
-    HUF_CREATE_STATIC_DTABLEX1(tablex1, HUF_TABLELOG_MAX);
-    HUF_CREATE_STATIC_DTABLEX2(tablex2, HUF_TABLELOG_MAX);
-    int16_t norm[FSE_MAX_SYMBOL_VALUE + 1];
-    FSE_DTable table[FSE_DTABLE_SIZE_U32(FSE_MAX_TABLELOG)];
+    size_t rSize = 0;
     size_t pieceIdx = 0;
     while (true)
     {
         uint8_t flag = *src++;
         do
         {
+            if (flag & (uint8_t)LZ3_stream_flag::MergedPiece)
+            {
+                size_t pSize = LZ3_read_LE16(src);
+                rSize += pSize;
+                pieces[pieceIdx++] = pSize;
+                break;
+            }
             if (flag & (uint8_t)LZ3_stream_flag::RawBytes)
             {
-                size_t rSize = LZ3_read_LE16(src);
+                size_t pSize = LZ3_read_LE16(src);
+                rSize += pSize;
                 memcpy(dst, src, rSize);
                 src += rSize;
                 dst += rSize;
-                pieces[pieceIdx++] = rSize;
+                pieces[pieceIdx++] = pSize;
+                rSize = 0;
                 break;
             }
             if (flag & (uint8_t)LZ3_stream_flag::BoundedBits)
@@ -1993,76 +1974,54 @@ const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, s
                     *b++ = (uint8_t)BIT_readBitsFast(&bitStr, nbBit);
                     BIT_reloadDStream(&bitStr);
                 }
-                size_t rSize = b - dst;
+                size_t dSize = b - dst;
                 src += cSize;
-                dst += rSize;
-                pieces[pieceIdx++] = rSize;
+                dst += dSize;
+                pieces[pieceIdx++] = dSize - rSize;
+                rSize = 0;
                 break;
             }
             if (flag & (uint8_t)LZ3_stream_flag::RunLength)
             {
-                size_t rSize = LZ3_read_LE16(src);
+                size_t pSize = LZ3_read_LE16(src);
+                rSize += pSize;
                 memset(dst, *src, rSize);
                 src += 1;
                 dst += rSize;
-                pieces[pieceIdx++] = rSize;
+                pieces[pieceIdx++] = pSize;
+                rSize = 0;
                 break;
             }
             if (flag & (uint8_t)LZ3_stream_flag::Huff0)
             {
                 size_t cSize = LZ3_read_LE16(src);
-                size_t rSize = LZ3_read_LE16(src);
-                uint32_t algo = HUF_selectDecoder(rSize, cSize);
-                size_t hSize = 0;
-                if (flag & (uint8_t)LZ3_stream_flag::NewHeader)
+                size_t pSize = LZ3_read_LE16(src);
+                rSize += pSize;
+                size_t dSize = HUF_decompress(dst, rSize, src, cSize);
+                if (HUF_isError(dSize))
                 {
-                    if (algo == 0)
-                    {
-                        hSize = HUF_readDTableX1_wksp(tablex1, src + cSize, 256, wksp, sizeof(wksp));
-                    }
-                    else
-                    {
-                        hSize = HUF_readDTableX2_wksp(tablex2, src + cSize, 256, wksp, sizeof(wksp));
-                    }
-                }
-                if (algo == 0)
-                {
-                    rSize = HUF_decompress4X1_usingDTable(dst, rSize, src, cSize, tablex1);
-                }
-                else
-                {
-                    rSize = HUF_decompress4X2_usingDTable(dst, rSize, src, cSize, tablex2);
-                }
-                if (HUF_isError(rSize))
-                {
-                    LZ3_last_error_name = HUF_getErrorName(rSize);
+                    LZ3_last_error_name = HUF_getErrorName(dSize);
                     return 0;
                 }
-                src += cSize + hSize;
-                dst += rSize;
-                pieces[pieceIdx++] = rSize;
+                src += cSize;
+                dst += dSize;
+                pieces[pieceIdx++] = pSize;
+                rSize = 0;
                 break;
             }
             if (flag & (uint8_t)LZ3_stream_flag::FSE)
             {
                 size_t cSize = LZ3_read_LE16(src);
-                size_t hSize = 0;
-                uint32_t codeMax = FSE_MAX_SYMBOL_VALUE;
-                uint32_t tableLog = FSE_DEFAULT_TABLELOG;
-                if (flag & (uint8_t)LZ3_stream_flag::NewHeader)
+                size_t dSize = FSE_decompress(dst, dstCap, src, cSize);
+                if (FSE_isError(dSize))
                 {
-                    hSize = FSE_readNCount(norm, &codeMax, &tableLog, src + cSize, 512);
-                }
-                FSE_buildDTable(table, norm, codeMax, tableLog);
-                size_t rSize = FSE_decompress_usingDTable(dst, dstCap, src, cSize, table);
-                if (FSE_isError(rSize))
-                {
-                    LZ3_last_error_name = FSE_getErrorName(rSize);
+                    LZ3_last_error_name = FSE_getErrorName(dSize);
                     return 0;
                 }
-                src += cSize + hSize;
-                dst += rSize;
-                pieces[pieceIdx++] = rSize;
+                src += cSize;
+                dst += dSize;
+                pieces[pieceIdx++] = dSize - rSize;
+                rSize = 0;
                 break;
             }
         }
