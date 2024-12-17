@@ -36,7 +36,15 @@ using namespace std;
 * | offset mode | offset value | match length | literal length |
 */
 
-#define LZ3_MAX_ARRAY_SIZE (LZ3_MAX_BLOCK_SIZE + ((LZ3_HUF_DISTANCE_MAX > LZ3_DISTANCE_MAX) ? LZ3_HUF_DISTANCE_MAX : LZ3_DISTANCE_MAX))
+class LZ3_match_info
+{
+public:
+    uint32_t position;
+    uint32_t length;
+    uint32_t offset;
+};
+
+#define LZ3_MAX_ARRAY_SIZE (LZ3_MAX_BLOCK_SIZE + LZ3_DISTANCE_MAX)
 
 class LZ3_suffix_array
 {
@@ -233,14 +241,6 @@ private:
 
 static constexpr uint32_t min_match_length = 3;
 
-class LZ3_match_info
-{
-public:
-    uint32_t position;
-    uint32_t length;
-    uint32_t offset;
-};
-
 class LZ3_match_iter : public LZ3_match_info
 {
 public:
@@ -287,6 +287,265 @@ private:
     uint32_t next;    //向后遍历到的后缀排名
 };
 
+class LZ3_match_list;
+
+struct LZ3_match_node
+{
+    uint32_t position;
+    LZ3_match_list* high;
+};
+
+class LZ3_match_list
+{
+public:
+    static constexpr uint32_t default_cap = 1;
+
+    static LZ3_match_list* create(uint32_t level, uint32_t cap = default_cap)
+    {
+        LZ3_match_list* list = reinterpret_cast<LZ3_match_list*>(new uint8_t[sizeof(LZ3_match_list) + sizeof(LZ3_match_node) * ((max(cap, default_cap) - default_cap))]);
+        list->level = level;
+        list->len = 0;
+        list->cap = cap;
+        return list;
+    }
+
+    static void remove(LZ3_match_list* list)
+    {
+        delete[] reinterpret_cast<uint8_t*>(list);
+    }
+
+    static LZ3_match_list* reserve(LZ3_match_list* list, uint32_t cap)
+    {
+        if (cap <= list->cap)
+        {
+            return list;
+        }
+        LZ3_match_list* ext = create(list->level, cap);
+        ext->len = list->len;
+        copy_n(list->nodes, list->len, ext->nodes);
+        remove(list);
+        list = ext;
+        return list;
+    }
+
+    static LZ3_match_list* append(LZ3_match_list* list, uint32_t position)
+    {
+        if (list->len == list->cap)
+        {
+            list = reserve(list, list->cap * 2);
+        }
+        LZ3_match_node& n = list->nodes[list->len++];
+        n.position = position;
+        n.high = nullptr;
+        return list;
+    }
+
+    uint32_t level;
+    uint32_t len;
+    uint32_t cap;
+    LZ3_match_node nodes[default_cap];
+
+    LZ3_match_list() = delete;
+};
+
+static constexpr uint32_t min_match_level = 8;
+
+class LZ3_match_chain
+{
+public:
+    static uint32_t hash(const uint8_t* s, uint32_t l)
+    {
+        uint32_t h = 0x811c9dc5;
+        for (uint32_t i = 0; i < l; i++)
+        {
+            h ^= s[i];
+            h *= 0x01000193;
+        }
+        return h;
+    }
+
+    vector<LZ3_match_list*> slots[4096];
+
+    uint32_t m;
+
+    LZ3_match_chain()
+    {
+        m = 0;
+    }
+
+    ~LZ3_match_chain()
+    {
+        shrink(m);
+        for (auto& slot : slots)
+        {
+            for (LZ3_match_list* list : slot)
+            {
+                LZ3_match_list::remove(list);
+            }
+        }
+    }
+
+    void insert(const uint8_t* s, uint32_t l, uint32_t position)
+    {
+        if (position + min_match_level >= l)
+        {
+            return;
+        }
+        auto& slot = slots[hash(s + position, min_match_level) % 4096];
+        auto it = find_if(slot.begin(), slot.end(), [=](LZ3_match_list* list)
+        {
+            return memcmp(s + position, s + list->nodes[0].position, min_match_level) == 0;
+        });
+        if (it == slot.end())
+        {
+            LZ3_match_list* list = LZ3_match_list::create(min_match_level);
+            slot.push_back(LZ3_match_list::append(list, position));
+        }
+        else
+        {
+            *it = LZ3_match_list::append(*it, position);
+        }
+    }
+
+    void shrink(uint32_t t)
+    {
+        vector<LZ3_match_list*> stack;
+        vector<LZ3_match_list*> dangling;
+        for (auto& slot : slots)
+        {
+            stack.insert(stack.end(), slot.begin(), slot.end());
+        }
+        while (!stack.empty())
+        {
+            LZ3_match_list* list = stack.back();
+            stack.pop_back();
+            uint32_t i = 0;
+            for (uint32_t j = 0; j < list->len; ++j)
+            {
+                LZ3_match_node& n = list->nodes[j];
+                if (n.position < t)
+                {
+                    if (n.high != nullptr)
+                    {
+                        dangling.push_back(n.high);
+                    }
+                }
+                else
+                {
+                    if (n.high != nullptr)
+                    {
+                        stack.push_back(n.high);
+                    }
+                    list->nodes[i].position = n.position - t;
+                    list->nodes[i].high = n.high;
+                    ++i;
+                }
+            }
+            list->len = i;
+        }
+        while (!dangling.empty())
+        {
+            LZ3_match_list* list = dangling.back();
+            dangling.pop_back();
+            for (uint32_t i = 0; i < list->len; ++i)
+            {
+                LZ3_match_node& n = list->nodes[i];
+                if (n.high != nullptr)
+                {
+                    dangling.push_back(n.high);
+                }
+            }
+            LZ3_match_list::remove(list);
+        }
+        m -= t;
+    }
+
+    const LZ3_match_list* match_highest(const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance)
+    {
+        if (position + min_match_level >= l)
+        {
+            return nullptr;
+        }
+        auto& slot = slots[hash(s + position, min_match_level) % 4096];
+        auto it = find_if(slot.begin(), slot.end(), [=](LZ3_match_list* list)
+        {
+            return memcmp(s + position, s + list->nodes[0].position, min_match_level) == 0;
+        });
+        if (it == slot.end())
+        {
+            return nullptr;
+        }
+        else
+        {
+            LZ3_match_list* list = *it;
+            while (position + list->level < l)
+            {
+                uint8_t b = s[position + list->level];
+                LZ3_match_node* gate = nullptr;
+                LZ3_match_list* high = nullptr;
+                vector<uint32_t> stack;
+                for (uint32_t i = list->len; i > 0;)
+                {
+                    LZ3_match_node& n = list->nodes[--i];
+                    if (position > n.position + max_distance)
+                    {
+                        break;
+                    }
+                    if (s[n.position + list->level] == b)
+                    {
+                        if (gate == nullptr)
+                        {
+                            gate = &n;
+                            if (n.high != nullptr)
+                            {
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            if (n.high != nullptr)
+                            {
+                                high = n.high;
+                                n.high = nullptr;
+                                break;
+                            }
+                            else
+                            {
+                                stack.push_back(n.position);
+                            }
+                        }
+                    }
+                }
+                if (gate == nullptr)
+                {
+                    break;
+                }
+                if (gate->high == nullptr)
+                {
+                    uint32_t count = (uint32_t)stack.size() + 1;
+                    if (high == nullptr)
+                    {
+                        high = LZ3_match_list::create(list->level + 1, count);
+                    }
+                    else
+                    {
+                        high = LZ3_match_list::reserve(high, high->cap + count);
+                    }
+                    while (!stack.empty())
+                    {
+                        high = LZ3_match_list::append(high, stack.back());
+                        stack.pop_back();
+                    }
+                    high = LZ3_match_list::append(high, gate->position);
+                    gate->high = high;
+                }
+                list = high;
+            }
+            return list;
+        }
+    }
+};
+
 class LZ3_match_optm : public LZ3_match_info
 {
 public:
@@ -302,7 +561,6 @@ public:
 
 enum LZ3_compress_param
 {
-    MaxMatchDistance,
     SufficientMatchLength,
     MaxMatchCount,
     MinFurtherOffset,
@@ -325,16 +583,16 @@ enum LZ3_compress_param
 
 static uint32_t default_params[LZ3_CLevel::LZ3_CLevel_Max + 1][LZ3_compress_param::Count] =
 {
-    { 0x7FFF,  128,  1,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
-    { 0x7FFF,  128,  2,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 }, //CLevel_Min
-    { 0x7FFF,  128,  4,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
-    { 0x7FFF,  128,  8,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 }, //CLevel_Fast
-    { 0xFFFF,  172,  16,  1,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
-    { 0xFFFF,  172,  32,  1,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 }, //CLevel_Normal
-    { 0xFFFF,  172,  64,  2,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 },
-    { 0x17FFF, 256,  128, 4,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 }, //CLevel_Optimal
-    { 0x17FFF, 256,  256, 16, 100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 100, 0, 100, 0 },
-    { 0x1FFFE, 384,  512, 64, 100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 100, 0, 100, 0 }, //CLevel_MAX
+    { 128,  1,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
+    { 128,  2,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 }, //CLevel_Min
+    { 128,  4,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
+    { 128,  8,   0,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 }, //CLevel_Fast
+    { 172,  16,  1,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 98,  0, 98,  0 },
+    { 172,  32,  1,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 }, //CLevel_Normal
+    { 172,  64,  2,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 },
+    { 256,  128, 4,  100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 99,  0, 99,  0 }, //CLevel_Optimal
+    { 256,  256, 16, 100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 100, 0, 100, 0 },
+    { 384,  512, 64, 100, 0, 100, 0, 105, 0, 100, 0, 100, 0, 100, 0, 100, 0 }, //CLevel_MAX
 };
 
 enum class LZ3_entropy_coder
@@ -476,7 +734,8 @@ static uint32_t of_base[] = {
     1,        2,        3,        5,        7,        11,       15,       0x17,
     0x1F,     0x2F,     0x3F,     0x5F,     0x7F,     0xBF,     0xFF,     0x17F,
     0x1FF,    0x2FF,    0x3FF,    0x5FF,    0x7FF,    0xBFF,    0xFFF,    0x17FF,
-    0x1FFF,   0x2FFF,   0x3FFF,   0x5FFF,   0x7FFF,   0xBFFF,   0xFFFF,   0x17FFF
+    0x1FFF,   0x2FFF,   0x3FFF,   0x5FFF,   0x7FFF,   0xBFFF,   0xFFFF,   0x17FFF,
+    0x1FFFF,  0x2FFFF
 };
 
 static uint8_t of_bits[] = {
@@ -484,7 +743,8 @@ static uint8_t of_bits[] = {
     0,        0,        1,        1,        2,        2,        3,        3,
     4,        4,        5,        5,        6,        6,        7,        7,
     8,        8,        9,        9,        10,       10,       11,       11,
-    12,       12,       13,       13,       14,       14,       15,       15
+    12,       12,       13,       13,       14,       14,       15,       15,
+    16,       16
 };
 
 /*dx_base and dx_bits will be generated based on lineSize
@@ -510,7 +770,7 @@ static constexpr uint32_t dy_base[] = {
     8,        9,        10,       11,       12,       13,       14,       15,
     16,       18,       20,       22,       24,       28,       32,       40,
     48,       64,       0x80,     0x100,    0x200,    0x400,    0x800,    0x1000,
-    0x2000,   0x4000,   0x8000
+    0x2000,   0x4000,   0x8000,   0x10000
 };
 
 static constexpr uint8_t dy_bits[] = {
@@ -519,7 +779,7 @@ static constexpr uint8_t dy_bits[] = {
     0,        0,        0,        0,        0,        0,        0,        0,
     1,        1,        1,        1,        2,        2,        3,        3,
     4,        6,        7,        8,        9,        10,       11,       12,
-    13,       14,       15
+    13,       14,       15,       16
 };
 
 static uint8_t LZ3_of_code(uint32_t value)
@@ -615,10 +875,6 @@ struct LZ3_DCtx
 static void LZ3_init_params(uint32_t params[LZ3_compress_param::Count], LZ3_CLevel level, LZ3_entropy_coder coder)
 {
     copy_n(default_params[level], LZ3_compress_param::Count, params);
-    if (coder == LZ3_entropy_coder::None && params[LZ3_compress_param::MaxMatchDistance] > LZ3_DISTANCE_MAX)
-    {
-        params[LZ3_compress_param::MaxMatchDistance] = LZ3_DISTANCE_MAX;
-    }
 }
 
 static uint8_t LZ3_gen_of_book(uint32_t* base, uint8_t* bits, LZ3_compress_flag flag, uint32_t blockLog, uint32_t lineSize)
@@ -1595,157 +1851,188 @@ template<
     typename LRawPrice, typename LLenPrice, typename MLenPrice, typename MOffPrice,
     typename LRawStats, typename LLenStats, typename MLenStats, typename MOffStats>
 static vector<LZ3_match_info> LZ3_compress_opt(
-    const LZ3_suffix_array* psa, const uint8_t* src, size_t srcSize,
+    const LZ3_suffix_array* psa, LZ3_match_chain* pmc, const uint8_t* src, uint32_t srcSize,
     uint32_t max_distance, uint32_t sufficient_length, uint32_t match_count, uint32_t further_offset,
     LRawPrice lRawPrice, LLenPrice lLenPrice, MLenPrice mLenPrice, MOffPrice mOffPrice,
     LRawStats lRawStats, LLenStats lLenStats, MLenStats mLenStats, MOffStats mOffStats)
 {
-    uint32_t hisSize = psa->n - (uint32_t)srcSize;
-    uint32_t srcPos = hisSize;
+    uint32_t saHis = psa->n - srcSize;
+    uint32_t mcHis = 0;
+    if (pmc != nullptr)
+    {
+        mcHis = pmc->m - srcSize;
+    }
+    uint32_t srcPos = 0;
     vector<LZ3_match_info> matches;
     vector<LZ3_match_optm> optimal;
     vector<LZ3_match_optm> reverse;
     for (uint32_t i = 0; i < srcSize;)
     {
-        LZ3_match_iter match(psa, i + hisSize);
-        if (match.match_next(psa, min_match_length, max_distance))
+        uint32_t lastPos = 0;
+        LZ3_match_optm lastMatch;
+        if (pmc != nullptr)
         {
-            optimal.clear();
-            uint32_t lastPos = match.length;
-            LZ3_match_optm lastMatch;
-            if (match.length > sufficient_length)
+            const LZ3_match_list* matchHighest = pmc->match_highest(src - mcHis, srcSize + mcHis, i + mcHis, max_distance);
+            if (matchHighest != nullptr && matchHighest->level > sufficient_length)
             {
-                lastMatch.position = match.position;
-                lastMatch.length = match.length;
-                lastMatch.offset = match.offset;
-                lastMatch.literal = match.position - srcPos;
-                goto sufficient_short_path;
-            }
-            optimal.resize(lastPos + 1);
-            {
-                /* initialize optimal[0] */
-                uint32_t lLen = match.position - srcPos;
-                optimal[0].literal = lLen;
-                for (uint32_t p = 0; p < 3 && p < matches.size(); ++p)
+                for (uint32_t j = matchHighest->len; j > 0;)
                 {
-                    optimal[0].preOff[p] = matches[matches.size() - 1 - p].offset;
-                }
-                optimal[0].price = lLenPrice(lLen);
-                /* Set prices for first matches */
-                int64_t llp = optimal[0].price + lLenPrice(0);
-                for (uint32_t count = 0; count < match_count; ++count)
-                {
-                    auto mop = mOffPrice(match.offset, optimal[0].preOff);
-                    if (mop == numeric_limits<decltype(mop)>::max())
-                    {
-                        continue;
-                    }
-                    for (uint32_t k = match.length; k >= min_match_length; --k)
-                    {
-                        uint32_t mlp = mLenPrice(k);
-                        int64_t price = llp + mlp + mop;
-                        if (price < optimal[k].price)
-                        {
-                            optimal[k].position = match.position;
-                            optimal[k].length = k;
-                            optimal[k].offset = match.offset;
-                            optimal[k].literal = lLen;
-                            optimal[k].preOff[2] = optimal[0].preOff[1];
-                            optimal[k].preOff[1] = optimal[0].preOff[0];
-                            optimal[k].preOff[0] = match.offset;
-                            optimal[k].price = price;
-                        }
-                    }
-                    if (!match.match_next(psa, min_match_length, max_distance))
+                    uint32_t offset = i + mcHis - matchHighest->nodes[--j].position;
+                    if (offset > max_distance)
                     {
                         break;
                     }
+                    lastPos = matchHighest->level;
+                    lastMatch.position = i;
+                    lastMatch.length = matchHighest->level;
+                    lastMatch.offset = offset;
+                    lastMatch.literal = i - srcPos;
+                    goto sufficient_short_path;
                 }
             }
-            for (uint32_t j = 1; j <= lastPos; ++j)
+        }
+        {
+            LZ3_match_iter match(psa, i + saHis);
+            if (match.match_next(psa, min_match_length, max_distance))
             {
+                lastPos = match.length;
+                if (match.length > sufficient_length)
                 {
-                    /* Fix current position with one literal if cheaper */
-                    uint32_t lPos = i + j - 1;
-                    uint32_t lLen = optimal[j - 1].length == 0 ? optimal[j - 1].literal + 1 : 1;
-                    int64_t price = optimal[j - 1].price;
-                    price += lRawPrice(lPos, src[lPos]);
-                    price += lLenPrice(lLen);
-                    price -= lLenPrice(lLen - 1);
-                    if (price < optimal[j].price)
-                    {
-                        optimal[j].position = 0;
-                        optimal[j].length = 0;
-                        optimal[j].offset = 0;
-                        optimal[j].literal = lLen;
-                        optimal[j].preOff[2] = optimal[j - 1].preOff[2];
-                        optimal[j].preOff[1] = optimal[j - 1].preOff[1];
-                        optimal[j].preOff[0] = optimal[j - 1].preOff[0];
-                        optimal[j].price = price;
-                    }
+                    lastMatch.position = match.position - saHis;
+                    lastMatch.length = match.length;
+                    lastMatch.offset = match.offset;
+                    lastMatch.literal = match.position - saHis - srcPos;
+                    goto sufficient_short_path;
                 }
-                if (j < lastPos)
+                optimal.resize(lastPos + 1);
                 {
-                    /* Set prices using further matches found */
-                    uint32_t lLen = optimal[j].length == 0 ? optimal[j].literal : 0;
-                    uint32_t mopBest = numeric_limits<uint32_t>::max();
-                    uint32_t furtherLength = min_match_length;
-                    if (j + furtherLength + further_offset < lastPos + 1)
+                    /* initialize optimal[0] */
+                    uint32_t lLen = match.position - saHis - srcPos;
+                    optimal[0].literal = lLen;
+                    for (uint32_t p = 0; p < 3 && p < matches.size(); ++p)
                     {
-                        furtherLength = lastPos + 1 - j - further_offset;
+                        optimal[0].preOff[p] = matches[matches.size() - 1 - p].offset;
                     }
-                    while (j + furtherLength <= lastPos && optimal[j].price >= optimal[j + furtherLength].price)
+                    optimal[0].price = lLenPrice(lLen);
+                    /* Set prices for first matches */
+                    int64_t llp = optimal[0].price + lLenPrice(0);
+                    for (uint32_t count = 0; count < match_count; ++count)
                     {
-                        furtherLength++;
-                    }
-                    int64_t llp = optimal[j].price + lLenPrice(0);
-                    LZ3_match_iter furtherMatch(psa, i + hisSize + j);
-                    for (uint32_t furtherCount = 0; furtherCount < match_count; ++furtherCount)
-                    {
-                        if (!furtherMatch.match_next(psa, furtherLength, max_distance))
-                        {
-                            break;
-                        }
-                        if (j + furtherMatch.length > lastPos)
-                        {
-                            lastPos = j + furtherMatch.length;
-                            if (furtherMatch.length > sufficient_length)
-                            {
-                                lastMatch.position = furtherMatch.position;
-                                lastMatch.offset = furtherMatch.offset;
-                                lastMatch.length = furtherMatch.length;
-                                lastMatch.literal = lLen;
-                                goto sufficient_short_path;
-                            }
-                            optimal.resize(lastPos + 1);
-                        }
-                        uint32_t mop = mOffPrice(furtherMatch.offset, optimal[j].preOff);
-                        if (mop == numeric_limits<uint32_t>::max() || mop >= mopBest)
+                        auto mop = mOffPrice(match.offset, optimal[0].preOff);
+                        if (mop == numeric_limits<decltype(mop)>::max())
                         {
                             continue;
                         }
-                        mopBest = mop;
-                        for (uint32_t k = furtherMatch.length; k >= min_match_length; --k)
+                        for (uint32_t k = match.length; k >= min_match_length; --k)
                         {
                             uint32_t mlp = mLenPrice(k);
                             int64_t price = llp + mlp + mop;
-                            if (price < optimal[j + k].price)
+                            if (price < optimal[k].price)
                             {
-                                optimal[j + k].position = furtherMatch.position;
-                                optimal[j + k].length = k;
-                                optimal[j + k].offset = furtherMatch.offset;
-                                optimal[j + k].literal = lLen;
-                                optimal[j + k].preOff[2] = optimal[j].preOff[1];
-                                optimal[j + k].preOff[1] = optimal[j].preOff[0];
-                                optimal[j + k].preOff[0] = furtherMatch.offset;
-                                optimal[j + k].price = price;
+                                optimal[k].position = match.position - saHis;
+                                optimal[k].length = k;
+                                optimal[k].offset = match.offset;
+                                optimal[k].literal = lLen;
+                                optimal[k].preOff[2] = optimal[0].preOff[1];
+                                optimal[k].preOff[1] = optimal[0].preOff[0];
+                                optimal[k].preOff[0] = match.offset;
+                                optimal[k].price = price;
+                            }
+                        }
+                        if (!match.match_next(psa, min_match_length, max_distance))
+                        {
+                            break;
+                        }
+                    }
+                }
+                for (uint32_t j = 1; j <= lastPos; ++j)
+                {
+                    {
+                        /* Fix current position with one literal if cheaper */
+                        uint32_t lPos = i + j - 1;
+                        uint32_t lLen = optimal[j - 1].length == 0 ? optimal[j - 1].literal + 1 : 1;
+                        int64_t price = optimal[j - 1].price;
+                        price += lRawPrice(lPos, src[lPos]);
+                        price += lLenPrice(lLen);
+                        price -= lLenPrice(lLen - 1);
+                        if (price < optimal[j].price)
+                        {
+                            optimal[j].position = 0;
+                            optimal[j].length = 0;
+                            optimal[j].offset = 0;
+                            optimal[j].literal = lLen;
+                            optimal[j].preOff[2] = optimal[j - 1].preOff[2];
+                            optimal[j].preOff[1] = optimal[j - 1].preOff[1];
+                            optimal[j].preOff[0] = optimal[j - 1].preOff[0];
+                            optimal[j].price = price;
+                        }
+                    }
+                    if (j < lastPos)
+                    {
+                        /* Set prices using further matches found */
+                        uint32_t lLen = optimal[j].length == 0 ? optimal[j].literal : 0;
+                        uint32_t mopBest = numeric_limits<uint32_t>::max();
+                        uint32_t furtherLength = min_match_length;
+                        if (j + furtherLength + further_offset < lastPos + 1)
+                        {
+                            furtherLength = lastPos + 1 - j - further_offset;
+                        }
+                        while (j + furtherLength <= lastPos && optimal[j].price >= optimal[j + furtherLength].price)
+                        {
+                            furtherLength++;
+                        }
+                        int64_t llp = optimal[j].price + lLenPrice(0);
+                        LZ3_match_iter furtherMatch(psa, i + saHis + j);
+                        for (uint32_t furtherCount = 0; furtherCount < match_count; ++furtherCount)
+                        {
+                            if (!furtherMatch.match_next(psa, furtherLength, max_distance))
+                            {
+                                break;
+                            }
+                            if (j + furtherMatch.length > lastPos)
+                            {
+                                lastPos = j + furtherMatch.length;
+                                if (furtherMatch.length > sufficient_length)
+                                {
+                                    lastMatch.position = furtherMatch.position - saHis;
+                                    lastMatch.offset = furtherMatch.offset;
+                                    lastMatch.length = furtherMatch.length;
+                                    lastMatch.literal = lLen;
+                                    goto sufficient_short_path;
+                                }
+                                optimal.resize(lastPos + 1);
+                            }
+                            uint32_t mop = mOffPrice(furtherMatch.offset, optimal[j].preOff);
+                            if (mop == numeric_limits<uint32_t>::max() || mop >= mopBest)
+                            {
+                                continue;
+                            }
+                            mopBest = mop;
+                            for (uint32_t k = furtherMatch.length; k >= min_match_length; --k)
+                            {
+                                uint32_t mlp = mLenPrice(k);
+                                int64_t price = llp + mlp + mop;
+                                if (price < optimal[j + k].price)
+                                {
+                                    optimal[j + k].position = furtherMatch.position - saHis;
+                                    optimal[j + k].length = k;
+                                    optimal[j + k].offset = furtherMatch.offset;
+                                    optimal[j + k].literal = lLen;
+                                    optimal[j + k].preOff[2] = optimal[j].preOff[1];
+                                    optimal[j + k].preOff[1] = optimal[j].preOff[0];
+                                    optimal[j + k].preOff[0] = furtherMatch.offset;
+                                    optimal[j + k].price = price;
+                                }
                             }
                         }
                     }
                 }
+                lastMatch = optimal[lastPos];
             }
-            lastMatch = optimal[lastPos];
-        sufficient_short_path:
+        }
+    sufficient_short_path:
+        if (lastPos > 0)
+        {
             reverse.clear();
             for (uint32_t j = lastPos;;)
             {
@@ -1762,9 +2049,10 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 j -= back;
                 lastMatch = optimal[j];
             }
+            optimal.clear();
             for (auto m = reverse.rbegin(); m != reverse.rend(); ++m)
             {
-                lRawStats(srcPos - hisSize, m->literal, src);
+                lRawStats(srcPos, m->literal, src);
                 srcPos += m->literal;
                 uint32_t preOff[3] = { 0 };
                 for (uint32_t p = 0; p < 3 && p < matches.size(); ++p)
@@ -1777,10 +2065,18 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 mOffStats(m->offset, preOff);
                 srcPos += m->length;
             }
+            for (uint32_t j = 0; pmc && j < lastPos; ++j)
+            {
+                pmc->insert(src - mcHis, srcSize + mcHis, i + mcHis + j);
+            }
             i += lastPos;
         }
         else
         {
+            if (pmc)
+            {
+                pmc->insert(src - mcHis, srcSize + mcHis, i + mcHis);
+            }
             ++i;
         }
     }
@@ -2047,19 +2343,18 @@ static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t*& dst, size_t
 }
 
 template<LZ3_entropy_coder coder>
-static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcSize, const uint32_t* params, LZ3_suffix_array* hsa, LZ3_suffix_array* tsa)
+static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, uint32_t srcSize, const uint32_t* params, LZ3_suffix_array* hsa, LZ3_suffix_array* tsa, LZ3_match_chain* pmc)
 {
     LZ3_CCtx cctx;
 	const LZ3_suffix_array* psa;
-    tsa->n = (uint32_t)srcSize;
-	tsa->cal_suffix_array(src, (uint32_t)srcSize);
-	tsa->cal_height(src, (uint32_t)srcSize);
-	uint32_t maxDistance = params[LZ3_compress_param::MaxMatchDistance];
+    tsa->n = srcSize;
+	tsa->cal_suffix_array(src, srcSize);
+	tsa->cal_height(src, srcSize);
 	if (hsa != nullptr)
 	{
-        if (hsa->n > maxDistance)
+        if (hsa->n > LZ3_DISTANCE_MAX)
         {
-            hsa->popn_suffix(hsa->n - maxDistance);
+            hsa->popn_suffix(hsa->n - LZ3_DISTANCE_MAX);
         }
         hsa->push_suffix(src - hsa->n, tsa);
 		psa = hsa;
@@ -2068,7 +2363,16 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
 	{
 		psa = tsa;
 	}
-    uint32_t hisSize = psa->n - (uint32_t)srcSize;
+    if (pmc != nullptr)
+    {
+        if (pmc->m > LZ3_HUF_DISTANCE_MAX)
+        {
+            pmc->shrink(pmc->m - LZ3_HUF_DISTANCE_MAX);
+        }
+        pmc->m += srcSize;
+    }
+    uint32_t saHis = psa->n - srcSize;
+    (void)saHis;
 #if !defined(NDEBUG) && defined(LZ3_LOG_SA)
     ofstream sfs("LZ3_suffix_array.log");
     for (uint32_t i = 0; i < psa->n; ++i)
@@ -2085,7 +2389,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             l = max(l, psa->height[i + 1]);
         }
         l = min(l + 1, psa->n - psa->sa[i]);
-        const uint8_t* rawPtr = src + psa->sa[i] - hisSize;
+        const uint8_t* rawPtr = src + psa->sa[i] - saHis;
         for (uint32_t j = 0; j < l; ++j)
         {
             uint8_t c = rawPtr[j];
@@ -2146,8 +2450,8 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         auto nLenStats = [](uint32_t) {};
         auto mOffStats = [&freq](uint32_t v, uint32_t p[3]) { freq[v]++; };
         LZ3_init_params(cctx.params, LZ3_CLevel_Min, coder);
-        matches = LZ3_compress_opt(psa, src, srcSize,
-            cctx.params[LZ3_compress_param::MaxMatchDistance],
+        matches = LZ3_compress_opt(psa, nullptr, src, srcSize,
+            LZ3_DISTANCE_MAX,
             cctx.params[LZ3_compress_param::SufficientMatchLength],
             cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
@@ -2196,8 +2500,8 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             }
         };
         auto nOffStats = [](uint32_t, uint32_t[3]) {};
-        matches = LZ3_compress_opt(psa, src, srcSize,
-            cctx.params[LZ3_compress_param::MaxMatchDistance],
+        matches = LZ3_compress_opt(psa, pmc, src, srcSize,
+            LZ3_DISTANCE_MAX,
             cctx.params[LZ3_compress_param::SufficientMatchLength],
             cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
@@ -2288,8 +2592,8 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             mOffHist.eval_base();
         };
         LZ3_init_params(cctx.params, LZ3_CLevel_Min, coder);
-        matches = LZ3_compress_opt(psa, src, srcSize,
-            cctx.params[LZ3_compress_param::MaxMatchDistance],
+        matches = LZ3_compress_opt(psa, nullptr, src, srcSize,
+            LZ3_HUF_DISTANCE_MAX,
             cctx.params[LZ3_compress_param::SufficientMatchLength],
             cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
@@ -2330,8 +2634,8 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             }, offset, cctx.flag, preOff, cctx.blockSize, cctx.blockLog, cctx.lineSize, cctx.of_base, cctx.of_bits);
             mOffHist.eval_base();
         };
-        matches = LZ3_compress_opt(psa, src, srcSize,
-            cctx.params[LZ3_compress_param::MaxMatchDistance],
+        matches = LZ3_compress_opt(psa, pmc, src, srcSize,
+            LZ3_HUF_DISTANCE_MAX,
             cctx.params[LZ3_compress_param::SufficientMatchLength],
             cctx.params[LZ3_compress_param::MaxMatchCount],
             cctx.params[LZ3_compress_param::MinFurtherOffset],
@@ -2340,7 +2644,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
     }
 #if !defined(NDEBUG) && defined(LZ3_LOG_SEQ)
     static uint32_t ci;
-    if (hisSize == 0)
+    if (saHis == 0)
     {
         ci = 0;
     }
@@ -2351,7 +2655,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
     srcPos = 0;
     for (const LZ3_match_info& match : matches)
     {
-        uint32_t position = match.position - hisSize;
+        uint32_t position = match.position;
         uint32_t literal = (uint32_t)(position - srcPos);
         uint32_t length = match.length;
         uint32_t offset = match.offset;
@@ -2371,7 +2675,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         }
         for (const LZ3_match_info& match : matches)
         {
-            uint32_t position = match.position - hisSize;
+            uint32_t position = match.position;
             if (position < srcPos)
             {
                 continue;
@@ -2408,7 +2712,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         }
         if (srcSize > srcPos)
         {
-            uint32_t literal = (uint32_t)(srcSize - srcPos);
+            uint32_t literal = srcSize - srcPos;
             uint16_t token = (uint16_t)((literal >= 0xF ? 0xF : literal));
             LZ3_write_LE16(dstPtr, token);
             if (literal >= 0xF)
@@ -2434,7 +2738,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         srcPos = 0;
         for (const LZ3_match_info& match : matches)
         {
-            uint32_t position = match.position - hisSize;
+            uint32_t position = match.position;
             if (position < srcPos)
             {
                 continue;
@@ -2483,7 +2787,7 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         LZ3_write_stream(dstPtr, ofs.data(), ofs.size(), coder, sui, sut);
         LZ3_write_stream(dstPtr, mls.data(), mls.size(), coder, sui, sut);
         BIT_CStream_t bitStr;
-        BIT_initCStream(&bitStr, dstPtr + sizeof(uint16_t), ext.size() * 2/*15bit*/ + 1 + sizeof(size_t));
+        BIT_initCStream(&bitStr, dstPtr + sizeof(uint16_t), ext.size() * 2/*sequence may have 16 extra bits*/ + 1 + sizeof(size_t));
         for (size_t i = ext.size(); i > 0; --i)
         {
             const pair<uint32_t, uint8_t>& bits = ext[i - 1];
@@ -2666,7 +2970,7 @@ LZ3_FORCE_INLINE static uint8x16x4_t LZ3_reload8x4x16(const uint8_t* lrsPtr, uin
 #endif
 
 template<LZ3_entropy_coder coder, LZ3_history_pos hisPos>
-static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t dstSize, size_t preSize, const uint8_t* ext, size_t extSize)
+static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, uint32_t dstSize, size_t preSize, const uint8_t* ext, size_t extSize)
 {
 #if !defined(NDEBUG) && defined(LZ3_LOG_SEQ)
     static uint32_t di;
@@ -3077,7 +3381,7 @@ uint32_t LZ3_compress_split_generic(const void* src, void* dst, uint32_t srcSize
         uint32_t params[LZ3_compress_param::Count];
         LZ3_init_params(params, level, coder);
         LZ3_suffix_array* psa = new LZ3_suffix_array(srcSize);
-        dstPos = (uint32_t)LZ3_compress_generic<coder>((const uint8_t*)src, (uint8_t*)dst, srcSize, params, nullptr, psa);
+        dstPos = (uint32_t)LZ3_compress_generic<coder>((const uint8_t*)src, (uint8_t*)dst, srcSize, params, nullptr, psa, nullptr);
         delete psa;
     }
     else
@@ -3139,8 +3443,9 @@ struct LZ3_CStream
 {
     LZ3_suffix_array hsa;
     LZ3_suffix_array tsa;
+    LZ3_match_chain hmc;
     uint8_t* psz;
-    uint8_t sz[LZ3_MAX_ARRAY_SIZE];
+    uint8_t sz[LZ3_MAX_BLOCK_SIZE + LZ3_HUF_DISTANCE_MAX];
 
     LZ3_CStream()
     {
@@ -3159,15 +3464,14 @@ uint32_t LZ3_compress_continue_generic(LZ3_CStream* pcs, const void* src, void* 
         uint32_t curSize = min((uint32_t)(srcEnd - srcPtr), LZ3_MAX_BLOCK_SIZE);
         uint32_t params[LZ3_compress_param::Count];
         LZ3_init_params(params, level, coder);
-        uint32_t maxDistance = params[LZ3_compress_param::MaxMatchDistance];
         if (pcs->psz + curSize > pcs->sz + sizeof(pcs->sz))
         {
-            memcpy(pcs->sz, pcs->psz - maxDistance, maxDistance);
-            pcs->psz = pcs->sz + maxDistance;
+            memcpy(pcs->sz, pcs->psz - LZ3_HUF_DISTANCE_MAX, LZ3_HUF_DISTANCE_MAX);
+            pcs->psz = pcs->sz + LZ3_HUF_DISTANCE_MAX;
         }
         memcpy(pcs->psz, srcPtr, curSize);
         srcPtr += curSize;
-        dstPtr += LZ3_compress_generic<coder>(pcs->psz, dstPtr, curSize, params, &pcs->hsa, &pcs->tsa);
+        dstPtr += LZ3_compress_generic<coder>(pcs->psz, dstPtr, curSize, params, &pcs->hsa, &pcs->tsa, &pcs->hmc);
         pcs->psz += curSize;
     }
     return (uint32_t)(dstPtr - (uint8_t*)dst);
@@ -3223,7 +3527,7 @@ uint32_t LZ3_decompress_fast_continue_generic(LZ3_DStream* pds, const void* src,
     uint8_t* dstEnd = dstPtr + dstSize;
     while (dstPtr < dstEnd)
     {
-        size_t curSize = min<size_t>(dstEnd - dstPtr, LZ3_MAX_BLOCK_SIZE);
+        uint32_t curSize = min((uint32_t)(dstEnd - dstPtr), LZ3_MAX_BLOCK_SIZE);
         uint32_t max_distance = coder == LZ3_entropy_coder::None ? LZ3_DISTANCE_MAX : LZ3_HUF_DISTANCE_MAX;
         if (pds->preSize == 0)
         {

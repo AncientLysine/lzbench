@@ -41,7 +41,7 @@ extern "C" {
 #endif 
 
 #ifndef LZ3_HUF_DISTANCE_MAX
-#define LZ3_HUF_DISTANCE_MAX 0x1FFFFu
+#define LZ3_HUF_DISTANCE_MAX 0x3FFFEu
 #endif 
 
  typedef enum LZ3_CLevel
