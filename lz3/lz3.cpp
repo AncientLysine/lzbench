@@ -287,68 +287,21 @@ private:
     uint32_t next;    //向后遍历到的后缀排名
 };
 
-class LZ3_match_list;
-
-struct LZ3_match_node
-{
-    uint32_t position;
-    LZ3_match_list* high;
-};
-
-class LZ3_match_list
+class LZ3_match_node
 {
 public:
-    static constexpr uint32_t default_cap = 1;
-
-    static LZ3_match_list* create(uint32_t level, uint32_t cap = default_cap)
-    {
-        LZ3_match_list* list = reinterpret_cast<LZ3_match_list*>(new uint8_t[sizeof(LZ3_match_list) + sizeof(LZ3_match_node) * ((max(cap, default_cap) - default_cap))]);
-        list->level = level;
-        list->len = 0;
-        list->cap = cap;
-        return list;
-    }
-
-    static void remove(LZ3_match_list* list)
-    {
-        delete[] reinterpret_cast<uint8_t*>(list);
-    }
-
-    static LZ3_match_list* reserve(LZ3_match_list* list, uint32_t cap)
-    {
-        if (cap <= list->cap)
-        {
-            return list;
-        }
-        LZ3_match_list* ext = create(list->level, cap);
-        ext->len = list->len;
-        copy_n(list->nodes, list->len, ext->nodes);
-        remove(list);
-        list = ext;
-        return list;
-    }
-
-    static LZ3_match_list* append(LZ3_match_list* list, uint32_t position)
-    {
-        if (list->len == list->cap)
-        {
-            list = reserve(list, list->cap * 2);
-        }
-        LZ3_match_node& n = list->nodes[list->len++];
-        n.position = position;
-        n.high = nullptr;
-        return list;
-    }
-
     uint32_t level;
-    uint32_t len;
-    uint32_t cap;
-    LZ3_match_node nodes[default_cap];
+    uint32_t position;
+    int32_t next;     //同阶节点偏移
+    int32_t high;     //高阶节点偏移(可反向)
 
-    LZ3_match_list() = delete;
+    LZ3_match_node(uint32_t position, uint32_t pi) :
+        level(0), position(position), next(pi + 1), high(pi + 1)
+    {
+    }
 };
 
-static constexpr uint32_t min_match_level = 8;
+static constexpr uint32_t min_match_level = 4;
 
 class LZ3_match_chain
 {
@@ -364,185 +317,192 @@ public:
         return h;
     }
 
-    vector<LZ3_match_list*> slots[4096];
-
-    uint32_t m;
+    uint32_t n;
 
     LZ3_match_chain()
     {
-        m = 0;
+        n = 0;
     }
 
-    ~LZ3_match_chain()
+    void popn_match(uint32_t t)
     {
-        shrink(m);
-        for (auto& slot : slots)
+        for (auto& chain : chains)
         {
-            for (LZ3_match_list* list : slot)
+            LZ3_match_node* ep = &chain.front();
+            for (auto ip = chain.rbegin(); ip != chain.rend(); ++ip)
             {
-                LZ3_match_list::remove(list);
+                LZ3_match_node* gp = &(*ip); //出口节点
+                if (gp->position < t)
+                {
+                    break;
+                }
+                for (LZ3_match_node* gn = gp - gp->high; gn >= ep; gn = gn - gn->high)
+                {
+                    if (gn->position >= t)
+                    {
+                        gp = gn;
+                    }
+                    else
+                    {
+                        gp->high += gn->high;
+                    }
+                }
             }
+            auto cp = chain.begin();
+            for (auto ip = chain.begin(); ip != chain.end(); ++ip)
+            {
+                if (ip->position >= t)
+                {
+                    cp->level = ip->level;
+                    cp->position = ip->position - t;
+                    cp->next = ip->next;
+                    cp->high = ip->high;
+                    ++cp;
+                }
+            }
+            chain.erase(cp, chain.end());
         }
+        n -= t;
     }
 
-    void insert(const uint8_t* s, uint32_t l, uint32_t position)
+    void blind_insert(const uint8_t* s, uint32_t l, uint32_t position)
+    {
+        auto& chain = chains[hash(s + position, min_match_level) % 4096];
+        blind_insert(chain, s, l, position);
+    }
+
+    LZ3_match_node* match_insert(const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance)
+    {
+        auto& chain = chains[hash(s + position, min_match_level) % 4096];
+        return match_insert(chain, s, l, position, max_distance);
+    }
+
+private:
+    vector<LZ3_match_node> chains[4096];
+
+    LZ3_match_node* blind_insert(vector<LZ3_match_node>& chain, const uint8_t* s, uint32_t l, uint32_t position)
     {
         if (position + min_match_level >= l)
         {
-            return;
+            return nullptr;
         }
-        auto& slot = slots[hash(s + position, min_match_level) % 4096];
-        auto it = find_if(slot.begin(), slot.end(), [=](LZ3_match_list* list)
+        int32_t pi = (int32_t)chain.size(); //悬垂节点位置
+        chain.emplace_back(position, pi);
+        LZ3_match_node* pp = &chain.back(); //悬垂节点指针
+        //初始最小阶匹配，排除hash冲突
+        for (int32_t ii = pi - 1; ii >= 0; ii--)
         {
-            return memcmp(s + position, s + list->nodes[0].position, min_match_level) == 0;
-        });
-        if (it == slot.end())
-        {
-            LZ3_match_list* list = LZ3_match_list::create(min_match_level);
-            slot.push_back(LZ3_match_list::append(list, position));
-        }
-        else
-        {
-            *it = LZ3_match_list::append(*it, position);
-        }
-    }
-
-    void shrink(uint32_t t)
-    {
-        vector<LZ3_match_list*> stack;
-        vector<LZ3_match_list*> dangling;
-        for (auto& slot : slots)
-        {
-            stack.insert(stack.end(), slot.begin(), slot.end());
-        }
-        while (!stack.empty())
-        {
-            LZ3_match_list* list = stack.back();
-            stack.pop_back();
-            uint32_t i = 0;
-            for (uint32_t j = 0; j < list->len; ++j)
+            LZ3_match_node* ip = &chain[ii];
+            if (memcmp(s + ip->position, s + position, min_match_level) == 0)
             {
-                LZ3_match_node& n = list->nodes[j];
-                if (n.position < t)
+                assert(ip->level == 0);
+                ip->level = min_match_level;
+                pp->next = pi - ii;
+                break;
+            }
+        }
+        return pp;
+    }
+    
+    LZ3_match_node* match_insert(vector<LZ3_match_node>& chain, const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance)
+    {
+        if (position + min_match_level >= l)
+        {
+            return nullptr;
+        }
+        LZ3_match_node* pp = blind_insert(chain, s, l, position); //悬垂节点
+        LZ3_match_node* ip = pp - pp->next; //遍历节点
+        LZ3_match_node* ep = &chain.front(); //终点节点
+        LZ3_match_node* gt = nullptr; //出口链表尾部
+        if (ip < ep)
+        {
+            return nullptr;
+        }
+        for (uint32_t cl = min_match_level; ; cl++)
+        {
+            if (position + cl > l)
+            {
+                return ip;
+            }
+            LZ3_match_node* ch = nullptr; //本阶链表头部
+            LZ3_match_node* ct = nullptr; //本阶链表尾部
+            LZ3_match_node* hh = nullptr; //高阶链表头部
+            LZ3_match_node* ht = nullptr; //高阶链表尾部
+            while (true)
+            {
+                if (s[ip->position + cl] == s[position + cl])
                 {
-                    if (n.high != nullptr)
+                    //遍历节点升阶
+                    if (ip->level <= cl)
                     {
-                        dangling.push_back(n.high);
+                        ip->level = cl + 1;
+                    }
+                    //遍历节点进入高阶链表
+                    if (hh == nullptr)
+                    {
+                        hh = ip;
+                        ht = hh;
+                    }
+                    else
+                    {
+                        ht->next = (int32_t)(ht - ip);
+                        ht = ip;
                     }
                 }
                 else
                 {
-                    if (n.high != nullptr)
+                    //遍历节点进入本阶链表
+                    if (ch == nullptr)
                     {
-                        stack.push_back(n.high);
-                    }
-                    list->nodes[i].position = n.position - t;
-                    list->nodes[i].high = n.high;
-                    ++i;
-                }
-            }
-            list->len = i;
-        }
-        while (!dangling.empty())
-        {
-            LZ3_match_list* list = dangling.back();
-            dangling.pop_back();
-            for (uint32_t i = 0; i < list->len; ++i)
-            {
-                LZ3_match_node& n = list->nodes[i];
-                if (n.high != nullptr)
-                {
-                    dangling.push_back(n.high);
-                }
-            }
-            LZ3_match_list::remove(list);
-        }
-        m -= t;
-    }
-
-    const LZ3_match_list* match_highest(const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance)
-    {
-        if (position + min_match_level >= l)
-        {
-            return nullptr;
-        }
-        auto& slot = slots[hash(s + position, min_match_level) % 4096];
-        auto it = find_if(slot.begin(), slot.end(), [=](LZ3_match_list* list)
-        {
-            return memcmp(s + position, s + list->nodes[0].position, min_match_level) == 0;
-        });
-        if (it == slot.end())
-        {
-            return nullptr;
-        }
-        else
-        {
-            LZ3_match_list* list = *it;
-            while (position + list->level < l)
-            {
-                uint8_t b = s[position + list->level];
-                LZ3_match_node* gate = nullptr;
-                LZ3_match_list* high = nullptr;
-                vector<uint32_t> stack;
-                for (uint32_t i = list->len; i > 0;)
-                {
-                    LZ3_match_node& n = list->nodes[--i];
-                    if (position > n.position + max_distance)
-                    {
-                        break;
-                    }
-                    if (s[n.position + list->level] == b)
-                    {
-                        if (gate == nullptr)
-                        {
-                            gate = &n;
-                            if (n.high != nullptr)
-                            {
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            if (n.high != nullptr)
-                            {
-                                high = n.high;
-                                n.high = nullptr;
-                                break;
-                            }
-                            else
-                            {
-                                stack.push_back(n.position);
-                            }
-                        }
-                    }
-                }
-                if (gate == nullptr)
-                {
-                    break;
-                }
-                if (gate->high == nullptr)
-                {
-                    uint32_t count = (uint32_t)stack.size() + 1;
-                    if (high == nullptr)
-                    {
-                        high = LZ3_match_list::create(list->level + 1, count);
+                        ch = ip;
+                        ct = ch;
                     }
                     else
                     {
-                        high = LZ3_match_list::reserve(high, high->cap + count);
+                        ct->next = (int32_t)(ct - ip);
+                        ct = ip;
                     }
-                    while (!stack.empty())
-                    {
-                        high = LZ3_match_list::append(high, stack.back());
-                        stack.pop_back();
-                    }
-                    high = LZ3_match_list::append(high, gate->position);
-                    gate->high = high;
                 }
-                list = high;
+                LZ3_match_node* in = ip - ip->next; //后续节点
+                if (in < ep)
+                {
+                    break;
+                }
+                if (in->level <= cl)
+                {
+                    ip->next = (int32_t)(ip - ep) + 1;
+                    ip = in;
+                }
+                else
+                {
+                    break;
+                }
             }
-            return list;
+            if (ch != nullptr)
+            {
+                //本阶链表非空，使用出口节点分叉
+                if (gt == nullptr)
+                {
+                    pp->next = (int32_t)(pp - ch);
+                    gt = pp;
+                }
+                else
+                {
+                    gt->high = (int32_t)(gt - ch);
+                    gt = ch;
+                }
+            }
+            if (hh != nullptr && pp->position - hh->position <= max_distance)
+            {
+                //高阶链表非空，循环继续
+                ip = hh;
+            }
+            else
+            {
+                return ch;
+            }
         }
+        return nullptr;
     }
 };
 
@@ -1860,7 +1820,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
     uint32_t mcHis = 0;
     if (pmc != nullptr)
     {
-        mcHis = pmc->m - srcSize;
+        mcHis = pmc->n - srcSize;
     }
     uint32_t srcPos = 0;
     vector<LZ3_match_info> matches;
@@ -1872,16 +1832,13 @@ static vector<LZ3_match_info> LZ3_compress_opt(
         LZ3_match_optm lastMatch;
         if (pmc != nullptr)
         {
-            const LZ3_match_list* matchHighest = pmc->match_highest(src - mcHis, srcSize + mcHis, i + mcHis, max_distance);
-            if (matchHighest != nullptr && matchHighest->level > sufficient_length)
+            const LZ3_match_node* matchHighest = pmc->match_insert(src - mcHis, srcSize + mcHis, i + mcHis, max_distance);
+            if (matchHighest != nullptr)
             {
-                for (uint32_t j = matchHighest->len; j > 0;)
+                uint32_t offset = i + mcHis - matchHighest->position;
+                assert(memcmp(src + i, src + i - offset, matchHighest->level) == 0);
+                if (matchHighest->level > sufficient_length)
                 {
-                    uint32_t offset = i + mcHis - matchHighest->nodes[--j].position;
-                    if (offset > max_distance)
-                    {
-                        break;
-                    }
                     lastPos = matchHighest->level;
                     lastMatch.position = i;
                     lastMatch.length = matchHighest->level;
@@ -2065,18 +2022,17 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 mOffStats(m->offset, preOff);
                 srcPos += m->length;
             }
-            for (uint32_t j = 0; pmc && j < lastPos; ++j)
+            if (pmc != nullptr)
             {
-                pmc->insert(src - mcHis, srcSize + mcHis, i + mcHis + j);
+                for (uint32_t j = 1; j < lastPos; ++j)
+                {
+                    pmc->blind_insert(src - mcHis, srcSize + mcHis, i + j + mcHis);
+                }
             }
             i += lastPos;
         }
         else
         {
-            if (pmc)
-            {
-                pmc->insert(src - mcHis, srcSize + mcHis, i + mcHis);
-            }
             ++i;
         }
     }
@@ -2365,11 +2321,11 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, uint32_t sr
 	}
     if (pmc != nullptr)
     {
-        if (pmc->m > LZ3_HUF_DISTANCE_MAX)
+        if (pmc->n > LZ3_HUF_DISTANCE_MAX)
         {
-            pmc->shrink(pmc->m - LZ3_HUF_DISTANCE_MAX);
+            pmc->popn_match(pmc->n - LZ3_HUF_DISTANCE_MAX);
         }
-        pmc->m += srcSize;
+        pmc->n += srcSize;
     }
     uint32_t saHis = psa->n - srcSize;
     (void)saHis;
