@@ -292,13 +292,18 @@ class LZ3_match_node
 public:
     uint32_t level;
     uint32_t position;
-    int32_t next;     //同阶节点偏移
-    int32_t high;     //高阶节点偏移(可反向)
 
     LZ3_match_node(uint32_t position, uint32_t pi) :
-        level(0), position(position), next(pi + 1), high(pi + 1)
+        level(0), position(position), next(pi + 1), gate(pi + 1), high(pi + 1)
     {
     }
+
+private:
+    friend class LZ3_match_chain;
+
+    int32_t next;     //后续节点偏移
+    int32_t gate;     //出口节点偏移（头部）
+    int32_t high;     //出口节点偏移（后续）
 };
 
 static constexpr uint32_t min_match_level = 4;
@@ -328,35 +333,60 @@ public:
     {
         for (auto& chain : chains)
         {
-            LZ3_match_node* ep = &chain.front();
-            for (auto ip = chain.rbegin(); ip != chain.rend(); ++ip)
+            if (chain.empty())
             {
-                LZ3_match_node* gp = &(*ip); //出口节点
-                if (gp->position < t)
+                continue;
+            }
+            LZ3_match_node* ep = &chain.front();
+            for (auto ii = chain.rbegin(); ii != chain.rend(); ++ii)
+            {
+                LZ3_match_node* ip = &(*ii); //遍历节点
+                if (ip->position >= t)
+                {
+                    LZ3_match_node* ig = ip - ip->gate;
+                    while (ig >= ep)
+                    {
+                        if (ig->position < t)
+                        {
+                            ip->gate += ig->high;
+                            ig = ip - ip->gate;
+                        }
+                        else
+                        {
+                            ip = ig;
+                            break;
+                        }
+                    }
+                    LZ3_match_node* ih = ip - ip->high;
+                    while (ih >= ep)
+                    {
+                        if (ih->position < t)
+                        {
+                            ip->high += ih->high;
+                            ih = ip - ip->high;
+                        }
+                        else
+                        {
+                            ip = ih;
+                            ih = ih - ih->high;
+                        }
+                    }
+                }
+                else
                 {
                     break;
                 }
-                for (LZ3_match_node* gn = gp - gp->high; gn >= ep; gn = gn - gn->high)
-                {
-                    if (gn->position >= t)
-                    {
-                        gp = gn;
-                    }
-                    else
-                    {
-                        gp->high += gn->high;
-                    }
-                }
             }
             auto cp = chain.begin();
-            for (auto ip = chain.begin(); ip != chain.end(); ++ip)
+            for (auto ii = chain.begin(); ii != chain.end(); ++ii)
             {
-                if (ip->position >= t)
+                if (ii->position >= t)
                 {
-                    cp->level = ip->level;
-                    cp->position = ip->position - t;
-                    cp->next = ip->next;
-                    cp->high = ip->high;
+                    cp->level = ii->level;
+                    cp->position = ii->position - t;
+                    cp->next = ii->next;
+                    cp->gate = ii->gate;
+                    cp->high = ii->high;
                     ++cp;
                 }
             }
@@ -367,12 +397,20 @@ public:
 
     void blind_insert(const uint8_t* s, uint32_t l, uint32_t position)
     {
+        if (position + min_match_level >= l)
+        {
+            return;
+        }
         auto& chain = chains[hash(s + position, min_match_level) % 4096];
         blind_insert(chain, s, l, position);
     }
 
     LZ3_match_node* match_insert(const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance)
     {
+        if (position + min_match_level >= l)
+        {
+            return nullptr;
+        }
         auto& chain = chains[hash(s + position, min_match_level) % 4096];
         return match_insert(chain, s, l, position, max_distance);
     }
@@ -382,13 +420,9 @@ private:
 
     LZ3_match_node* blind_insert(vector<LZ3_match_node>& chain, const uint8_t* s, uint32_t l, uint32_t position)
     {
-        if (position + min_match_level >= l)
-        {
-            return nullptr;
-        }
         int32_t pi = (int32_t)chain.size(); //悬垂节点位置
         chain.emplace_back(position, pi);
-        LZ3_match_node* pp = &chain.back(); //悬垂节点指针
+        LZ3_match_node* pp = &chain.back(); //悬垂节点
         //初始最小阶匹配，排除hash冲突
         for (int32_t ii = pi - 1; ii >= 0; ii--)
         {
@@ -420,7 +454,7 @@ private:
         }
         for (uint32_t cl = min_match_level; ; cl++)
         {
-            if (position + cl > l)
+            if (position + cl >= l)
             {
                 return ip;
             }
@@ -448,6 +482,57 @@ private:
                         ht->next = (int32_t)(ht - ip);
                         ht = ip;
                     }
+                    LZ3_match_node* in = ip - ip->next; //后续节点
+                    if (in >= ep)
+                    {
+                        if (in->level > cl)
+                        {
+                            //后续节点就高于当前阶，next、gate都匹配，已经进入高阶链表，维持不变
+                            //循环提前结束
+                            break;
+                        }
+                    }
+                    LZ3_match_node* ig = ip - ip->gate; //出口节点
+                    if (ig >= ep)
+                    {
+                        if (ig->level > cl)
+                        {
+                            //出口节点才高于当前阶，next不匹配、gate匹配
+                            {
+                                //出口节点脱离遍历节点gate
+                                ip->gate += ig->high;
+                                ig->high = (int32_t)(ig - ep) + 1;
+                                //出口节点进入高阶链表(同时也是遍历节点next)
+                                ht->next = (int32_t)(ht - ig);
+                                ht = ig;
+                            }
+                            if (in >= ep)
+                            {
+                                //后续节点进入本阶链表
+                                if (ch == nullptr)
+                                {
+                                    ch = in;
+                                    ct = ch;
+                                }
+                                else
+                                {
+                                    ct->next = (int32_t)(ct - in);
+                                    ct = in;
+                                }
+                            }
+                            //循环提前结束
+                            break;
+                        }
+                    }
+                    if (in >= ep)
+                    {
+                        ip->next = (int32_t)(ip - ep) + 1;
+                        ip = in;
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
                 else
                 {
@@ -462,25 +547,30 @@ private:
                         ct->next = (int32_t)(ct - ip);
                         ct = ip;
                     }
-                }
-                LZ3_match_node* in = ip - ip->next; //后续节点
-                if (in < ep)
-                {
-                    break;
-                }
-                if (in->level <= cl)
-                {
-                    ip->next = (int32_t)(ip - ep) + 1;
-                    ip = in;
-                }
-                else
-                {
-                    break;
+                    LZ3_match_node* in = ip - ip->next; //后续节点
+                    if (in >= ep)
+                    {
+                        if (in->level > cl)
+                        {
+                            //后续节点就高于当前阶，next、gate都不匹配，已经进入本阶链表，维持不变
+                            //循环提前结束
+                            break;
+                        }
+                    }
+                    if (in >= ep)
+                    {
+                        ip->next = (int32_t)(ip - ep) + 1;
+                        ip = in;
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
             }
             if (ch != nullptr)
             {
-                //本阶链表非空，使用出口节点分叉
+                //本阶链表非空，节点分叉
                 if (gt == nullptr)
                 {
                     pp->next = (int32_t)(pp - ch);
@@ -488,7 +578,14 @@ private:
                 }
                 else
                 {
-                    gt->high = (int32_t)(gt - ch);
+                    if (gt == pp)
+                    {
+                        gt->gate = (int32_t)(gt - ch);
+                    }
+                    else
+                    {
+                        gt->high = (int32_t)(gt - ch);
+                    }
                     gt = ch;
                 }
             }
