@@ -36,15 +36,8 @@ using namespace std;
 * | offset mode | offset value | match length | literal length |
 */
 
-class LZ3_match_info
-{
-public:
-    uint32_t position;
-    uint32_t length;
-    uint32_t offset;
-};
-
-#define LZ3_MAX_ARRAY_SIZE (LZ3_MAX_BLOCK_SIZE + LZ3_DISTANCE_MAX)
+#define LZ3_MAX_ARRAY_DISTANCE 0xFFFF
+#define LZ3_MAX_ARRAY_SIZE (LZ3_MAX_BLOCK_SIZE + LZ3_MAX_ARRAY_DISTANCE)
 
 class LZ3_suffix_array
 {
@@ -241,11 +234,15 @@ private:
 
 static constexpr uint32_t min_match_length = 3;
 
-class LZ3_match_iter : public LZ3_match_info
+class LZ3_match_iter
 {
 public:
+    uint32_t position;
+    uint32_t length;
+    uint32_t offset;
+
     LZ3_match_iter(const LZ3_suffix_array* psa, uint32_t position) :
-        LZ3_match_info{ position, LZ3_MAX_BLOCK_SIZE + 1, 0 }
+        position(position), length(LZ3_MAX_BLOCK_SIZE + 1)
     {
         prev = psa->rk[position];
         next = psa->rk[position] + 1;
@@ -286,6 +283,8 @@ private:
     uint32_t prev;    //向前遍历到的后缀排名
     uint32_t next;    //向后遍历到的后缀排名
 };
+
+#define LZ3_MAX_CHAIN_DISTANCE LZ3_HUF_DISTANCE_MAX
 
 class LZ3_match_node
 {
@@ -602,6 +601,24 @@ private:
     }
 };
 
+class LZ3_match_info
+{
+public:
+    uint32_t position;
+    uint32_t length;
+    uint32_t offset;
+
+    LZ3_match_info() :
+        position(0), length(0), offset(0)
+    {
+    }
+
+    LZ3_match_info(uint32_t position, uint32_t length, uint32_t offset) :
+        position(position), length(length), offset(offset)
+    {
+    }
+};
+
 class LZ3_match_optm : public LZ3_match_info
 {
 public:
@@ -610,7 +627,7 @@ public:
     int64_t price;
 
     LZ3_match_optm() :
-        LZ3_match_info{ 0 ,0, 0 }, literal(0), preOff{ 0 }, price(numeric_limits<int64_t>::max())
+        literal(0), preOff{ 0 }, price(numeric_limits<int64_t>::max())
     {
     }
 };
@@ -1917,6 +1934,10 @@ static vector<LZ3_match_info> LZ3_compress_opt(
     if (pmc != nullptr)
     {
         mcHis = pmc->n - srcSize;
+        for (uint32_t h = min(mcHis, min_match_level - 1); h > 0; --h)
+        {
+            pmc->blind_insert(src - mcHis, srcSize + mcHis, mcHis - h);
+        }
     }
     uint32_t srcPos = 0;
     vector<LZ3_match_info> matches;
@@ -1924,164 +1945,174 @@ static vector<LZ3_match_info> LZ3_compress_opt(
     vector<LZ3_match_optm> reverse;
     for (uint32_t i = 0; i < srcSize;)
     {
-        uint32_t lastPos = 0;
-        LZ3_match_optm lastMatch;
+        bool matched = false;
+        LZ3_match_info match;
+        LZ3_match_iter startingMatch(psa, i + saHis);
         if (pmc != nullptr)
         {
-            const LZ3_match_node* matchHighest = pmc->match_insert(src - mcHis, srcSize + mcHis, i + mcHis, max_distance);
-            if (matchHighest != nullptr)
+            const LZ3_match_node* highestMatch = pmc->match_insert(src - mcHis, srcSize + mcHis, i + mcHis, max_distance);
+            if (highestMatch != nullptr)
             {
-                uint32_t offset = i + mcHis - matchHighest->position;
-                assert(memcmp(src + i, src + i - offset, matchHighest->level) == 0);
-                if (matchHighest->level > sufficient_length)
-                {
-                    lastPos = matchHighest->level;
-                    lastMatch.position = i;
-                    lastMatch.length = matchHighest->level;
-                    lastMatch.offset = offset;
-                    lastMatch.literal = i - srcPos;
-                    goto sufficient_short_path;
-                }
+                matched = true;
+                match.position = i;
+                match.length = highestMatch->level;
+                match.offset = i + mcHis - highestMatch->position;
             }
         }
+        if (!matched)
         {
-            LZ3_match_iter match(psa, i + saHis);
-            if (match.match_next(psa, min_match_length, max_distance))
+            if (startingMatch.match_next(psa, min_match_length, max_distance))
             {
-                lastPos = match.length;
-                if (match.length > sufficient_length)
+                matched = true;
+                match.position = i;
+                match.length = startingMatch.length;
+                match.offset = startingMatch.offset;
+            }
+        }
+        uint32_t lastPos = 0;
+        LZ3_match_optm lastMatch;
+        if (matched)
+        {
+            lastPos = match.length;
+            if (match.length > sufficient_length)
+            {
+                lastMatch.position = match.position;
+                lastMatch.length = match.length;
+                lastMatch.offset = match.offset;
+                lastMatch.literal = i - srcPos;
+                goto sufficient_short_path;
+            }
+            optimal.resize(lastPos + 1);
+            {
+                /* initialize optimal[0] */
+                uint32_t lLen = match.position - srcPos;
+                optimal[0].literal = lLen;
+                for (uint32_t p = 0; p < 3 && p < matches.size(); ++p)
                 {
-                    lastMatch.position = match.position - saHis;
-                    lastMatch.length = match.length;
-                    lastMatch.offset = match.offset;
-                    lastMatch.literal = match.position - saHis - srcPos;
-                    goto sufficient_short_path;
+                    optimal[0].preOff[p] = matches[matches.size() - 1 - p].offset;
                 }
-                optimal.resize(lastPos + 1);
+                optimal[0].price = lLenPrice(lLen);
+                /* Set prices for first matches */
+                int64_t llp = optimal[0].price + lLenPrice(0);
+                for (uint32_t count = 0; count < match_count; ++count)
                 {
-                    /* initialize optimal[0] */
-                    uint32_t lLen = match.position - saHis - srcPos;
-                    optimal[0].literal = lLen;
-                    for (uint32_t p = 0; p < 3 && p < matches.size(); ++p)
+                    auto mop = mOffPrice(match.offset, optimal[0].preOff);
+                    if (mop == numeric_limits<decltype(mop)>::max())
                     {
-                        optimal[0].preOff[p] = matches[matches.size() - 1 - p].offset;
+                        continue;
                     }
-                    optimal[0].price = lLenPrice(lLen);
-                    /* Set prices for first matches */
-                    int64_t llp = optimal[0].price + lLenPrice(0);
-                    for (uint32_t count = 0; count < match_count; ++count)
+                    for (uint32_t k = match.length; k >= min_match_length; --k)
                     {
-                        auto mop = mOffPrice(match.offset, optimal[0].preOff);
-                        if (mop == numeric_limits<decltype(mop)>::max())
+                        uint32_t mlp = mLenPrice(k);
+                        int64_t price = llp + mlp + mop;
+                        if (price < optimal[k].price)
                         {
-                            continue;
+                            optimal[k].position = match.position;
+                            optimal[k].length = k;
+                            optimal[k].offset = match.offset;
+                            optimal[k].literal = lLen;
+                            optimal[k].preOff[2] = optimal[0].preOff[1];
+                            optimal[k].preOff[1] = optimal[0].preOff[0];
+                            optimal[k].preOff[0] = match.offset;
+                            optimal[k].price = price;
                         }
-                        for (uint32_t k = match.length; k >= min_match_length; --k)
-                        {
-                            uint32_t mlp = mLenPrice(k);
-                            int64_t price = llp + mlp + mop;
-                            if (price < optimal[k].price)
-                            {
-                                optimal[k].position = match.position - saHis;
-                                optimal[k].length = k;
-                                optimal[k].offset = match.offset;
-                                optimal[k].literal = lLen;
-                                optimal[k].preOff[2] = optimal[0].preOff[1];
-                                optimal[k].preOff[1] = optimal[0].preOff[0];
-                                optimal[k].preOff[0] = match.offset;
-                                optimal[k].price = price;
-                            }
-                        }
-                        if (!match.match_next(psa, min_match_length, max_distance))
+                    }
+                    if (startingMatch.match_next(psa, min_match_length, max_distance))
+                    {
+                        assert(startingMatch.length <= match.length);
+                        match.position = startingMatch.position - saHis;
+                        match.length = startingMatch.length;
+                        match.offset = startingMatch.offset;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+            for (uint32_t j = 1; j <= lastPos; ++j)
+            {
+                {
+                    /* Fix current position with one literal if cheaper */
+                    uint32_t lPos = i + j - 1;
+                    uint32_t lLen = optimal[j - 1].length == 0 ? optimal[j - 1].literal + 1 : 1;
+                    int64_t price = optimal[j - 1].price;
+                    price += lRawPrice(lPos, src[lPos]);
+                    price += lLenPrice(lLen);
+                    price -= lLenPrice(lLen - 1);
+                    if (price < optimal[j].price)
+                    {
+                        optimal[j].position = 0;
+                        optimal[j].length = 0;
+                        optimal[j].offset = 0;
+                        optimal[j].literal = lLen;
+                        optimal[j].preOff[2] = optimal[j - 1].preOff[2];
+                        optimal[j].preOff[1] = optimal[j - 1].preOff[1];
+                        optimal[j].preOff[0] = optimal[j - 1].preOff[0];
+                        optimal[j].price = price;
+                    }
+                }
+                if (j < lastPos)
+                {
+                    /* Set prices using further matches found */
+                    uint32_t lLen = optimal[j].length == 0 ? optimal[j].literal : 0;
+                    uint32_t mopBest = numeric_limits<uint32_t>::max();
+                    uint32_t furtherLength = min_match_length;
+                    if (j + furtherLength + further_offset < lastPos + 1)
+                    {
+                        furtherLength = lastPos + 1 - j - further_offset;
+                    }
+                    while (j + furtherLength <= lastPos && optimal[j].price >= optimal[j + furtherLength].price)
+                    {
+                        furtherLength++;
+                    }
+                    int64_t llp = optimal[j].price + lLenPrice(0);
+                    LZ3_match_iter furtherMatch(psa, i + saHis + j);
+                    for (uint32_t furtherCount = 0; furtherCount < match_count; ++furtherCount)
+                    {
+                        if (!furtherMatch.match_next(psa, furtherLength, max_distance))
                         {
                             break;
                         }
-                    }
-                }
-                for (uint32_t j = 1; j <= lastPos; ++j)
-                {
-                    {
-                        /* Fix current position with one literal if cheaper */
-                        uint32_t lPos = i + j - 1;
-                        uint32_t lLen = optimal[j - 1].length == 0 ? optimal[j - 1].literal + 1 : 1;
-                        int64_t price = optimal[j - 1].price;
-                        price += lRawPrice(lPos, src[lPos]);
-                        price += lLenPrice(lLen);
-                        price -= lLenPrice(lLen - 1);
-                        if (price < optimal[j].price)
+                        if (j + furtherMatch.length > lastPos)
                         {
-                            optimal[j].position = 0;
-                            optimal[j].length = 0;
-                            optimal[j].offset = 0;
-                            optimal[j].literal = lLen;
-                            optimal[j].preOff[2] = optimal[j - 1].preOff[2];
-                            optimal[j].preOff[1] = optimal[j - 1].preOff[1];
-                            optimal[j].preOff[0] = optimal[j - 1].preOff[0];
-                            optimal[j].price = price;
-                        }
-                    }
-                    if (j < lastPos)
-                    {
-                        /* Set prices using further matches found */
-                        uint32_t lLen = optimal[j].length == 0 ? optimal[j].literal : 0;
-                        uint32_t mopBest = numeric_limits<uint32_t>::max();
-                        uint32_t furtherLength = min_match_length;
-                        if (j + furtherLength + further_offset < lastPos + 1)
-                        {
-                            furtherLength = lastPos + 1 - j - further_offset;
-                        }
-                        while (j + furtherLength <= lastPos && optimal[j].price >= optimal[j + furtherLength].price)
-                        {
-                            furtherLength++;
-                        }
-                        int64_t llp = optimal[j].price + lLenPrice(0);
-                        LZ3_match_iter furtherMatch(psa, i + saHis + j);
-                        for (uint32_t furtherCount = 0; furtherCount < match_count; ++furtherCount)
-                        {
-                            if (!furtherMatch.match_next(psa, furtherLength, max_distance))
+                            lastPos = j + furtherMatch.length;
+                            if (furtherMatch.length > sufficient_length)
                             {
-                                break;
+                                lastMatch.position = furtherMatch.position - saHis;
+                                lastMatch.offset = furtherMatch.offset;
+                                lastMatch.length = furtherMatch.length;
+                                lastMatch.literal = lLen;
+                                goto sufficient_short_path;
                             }
-                            if (j + furtherMatch.length > lastPos)
+                            optimal.resize(lastPos + 1);
+                        }
+                        uint32_t mop = mOffPrice(furtherMatch.offset, optimal[j].preOff);
+                        if (mop == numeric_limits<uint32_t>::max() || mop >= mopBest)
+                        {
+                            continue;
+                        }
+                        mopBest = mop;
+                        for (uint32_t k = furtherMatch.length; k >= min_match_length; --k)
+                        {
+                            uint32_t mlp = mLenPrice(k);
+                            int64_t price = llp + mlp + mop;
+                            if (price < optimal[j + k].price)
                             {
-                                lastPos = j + furtherMatch.length;
-                                if (furtherMatch.length > sufficient_length)
-                                {
-                                    lastMatch.position = furtherMatch.position - saHis;
-                                    lastMatch.offset = furtherMatch.offset;
-                                    lastMatch.length = furtherMatch.length;
-                                    lastMatch.literal = lLen;
-                                    goto sufficient_short_path;
-                                }
-                                optimal.resize(lastPos + 1);
-                            }
-                            uint32_t mop = mOffPrice(furtherMatch.offset, optimal[j].preOff);
-                            if (mop == numeric_limits<uint32_t>::max() || mop >= mopBest)
-                            {
-                                continue;
-                            }
-                            mopBest = mop;
-                            for (uint32_t k = furtherMatch.length; k >= min_match_length; --k)
-                            {
-                                uint32_t mlp = mLenPrice(k);
-                                int64_t price = llp + mlp + mop;
-                                if (price < optimal[j + k].price)
-                                {
-                                    optimal[j + k].position = furtherMatch.position - saHis;
-                                    optimal[j + k].length = k;
-                                    optimal[j + k].offset = furtherMatch.offset;
-                                    optimal[j + k].literal = lLen;
-                                    optimal[j + k].preOff[2] = optimal[j].preOff[1];
-                                    optimal[j + k].preOff[1] = optimal[j].preOff[0];
-                                    optimal[j + k].preOff[0] = furtherMatch.offset;
-                                    optimal[j + k].price = price;
-                                }
+                                optimal[j + k].position = furtherMatch.position - saHis;
+                                optimal[j + k].length = k;
+                                optimal[j + k].offset = furtherMatch.offset;
+                                optimal[j + k].literal = lLen;
+                                optimal[j + k].preOff[2] = optimal[j].preOff[1];
+                                optimal[j + k].preOff[1] = optimal[j].preOff[0];
+                                optimal[j + k].preOff[0] = furtherMatch.offset;
+                                optimal[j + k].price = price;
                             }
                         }
                     }
                 }
-                lastMatch = optimal[lastPos];
             }
+            lastMatch = optimal[lastPos];
         }
     sufficient_short_path:
         if (lastPos > 0)
@@ -2112,7 +2143,7 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                 {
                     preOff[p] = matches[matches.size() - 1 - p].offset;
                 }
-                matches.push_back({srcPos , m->length, m->offset });
+                matches.emplace_back(srcPos , m->length, m->offset);
                 lLenStats(m->literal);
                 mLenStats(m->length);
                 mOffStats(m->offset, preOff);
@@ -2404,9 +2435,9 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, uint32_t sr
 	tsa->cal_height(src, srcSize);
 	if (hsa != nullptr)
 	{
-        if (hsa->n > LZ3_DISTANCE_MAX)
+        if (hsa->n > LZ3_MAX_ARRAY_DISTANCE)
         {
-            hsa->popn_suffix(hsa->n - LZ3_DISTANCE_MAX);
+            hsa->popn_suffix(hsa->n - LZ3_MAX_ARRAY_DISTANCE);
         }
         hsa->push_suffix(src - hsa->n, tsa);
 		psa = hsa;
@@ -2417,9 +2448,9 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, uint32_t sr
 	}
     if (pmc != nullptr)
     {
-        if (pmc->n > LZ3_HUF_DISTANCE_MAX)
+        if (pmc->n > LZ3_MAX_CHAIN_DISTANCE)
         {
-            pmc->popn_match(pmc->n - LZ3_HUF_DISTANCE_MAX);
+            pmc->popn_match(pmc->n - LZ3_MAX_CHAIN_DISTANCE);
         }
         pmc->n += srcSize;
     }
@@ -3518,7 +3549,7 @@ uint32_t LZ3_compress_continue_generic(LZ3_CStream* pcs, const void* src, void* 
         LZ3_init_params(params, level, coder);
         if (pcs->psz + curSize > pcs->sz + sizeof(pcs->sz))
         {
-            memcpy(pcs->sz, pcs->psz - LZ3_HUF_DISTANCE_MAX, LZ3_HUF_DISTANCE_MAX);
+            memmove(pcs->sz, pcs->psz - LZ3_HUF_DISTANCE_MAX, LZ3_HUF_DISTANCE_MAX);
             pcs->psz = pcs->sz + LZ3_HUF_DISTANCE_MAX;
         }
         memcpy(pcs->psz, srcPtr, curSize);
@@ -3560,7 +3591,7 @@ uint32_t LZ3_decompress_continue_generic(LZ3_DStream* pds, const void* src, void
         uint32_t max_distance = coder == LZ3_entropy_coder::None ? LZ3_DISTANCE_MAX : LZ3_HUF_DISTANCE_MAX;
         if (pds->psz + curSize > pds->sz + sizeof(pds->sz))
         {
-            memcpy(pds->sz, pds->psz - max_distance, max_distance);
+            memmove(pds->sz, pds->psz - max_distance, max_distance);
             pds->psz = pds->sz + max_distance;
         }
         srcPtr += LZ3_decompress_generic<coder, LZ3_history_pos::Prefix>(srcPtr, pds->psz, curSize, 0, nullptr, 0);
