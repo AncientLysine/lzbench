@@ -455,12 +455,19 @@ private:
             LZ3_match_node* ht = nullptr; //高阶链表尾部
             if (position + cl < l)
             {
+                uint32_t el = l - position - cl - 1; //额外阶数，高阶链表所有节点可额外提升阶数的最小值
                 while (true)
                 {
                     if (s[ip->position + cl] == s[position + cl])
                     {
+                        uint32_t ei = 1;
+                        while (ei <= el && s[ip->position + cl + ei] == s[position + cl + ei])
+                        {
+                            ei++;
+                        }
+                        el = ei - 1;
                         //遍历节点升阶
-                        if (ip->level <= cl)
+                        if (ip->level < cl + 1)
                         {
                             ip->level = cl + 1;
                         }
@@ -481,6 +488,8 @@ private:
                             if (in->level > cl)
                             {
                                 //后续节点就高于当前阶，next、gate都匹配，已经进入高阶链表，维持不变
+                                //额外提升阶数缩减
+                                el = min(el, in->level - cl - 1);
                                 //循环提前结束
                                 break;
                             }
@@ -513,6 +522,8 @@ private:
                                         ct = in;
                                     }
                                 }
+                                //额外提升阶数缩减
+                                el = min(el, ig->level - cl - 1);
                                 //循环提前结束
                                 break;
                             }
@@ -560,6 +571,21 @@ private:
                             break;
                         }
                     }
+                }
+                if (hh != nullptr && el > 0)
+                {
+                    //高阶链表非空，额外升阶
+                    ip = hh;
+                    while (ip >= ep)
+                    {
+                        assert(memcmp(s + ip->position, s + position, cl + 1 + el) == 0);
+                        if (ip->level < cl + 1 + el)
+                        {
+                            ip->level = cl + 1 + el;
+                        }
+                        ip = ip - ip->next;
+                    }
+                    cl += el;
                 }
             }
             else
