@@ -237,18 +237,14 @@ static constexpr uint32_t min_match_length = 3;
 class LZ3_match_iter
 {
 public:
-    uint32_t position;
-    uint32_t length;
-    uint32_t offset;
-
     LZ3_match_iter(const LZ3_suffix_array* psa, uint32_t position) :
-        position(position), length(LZ3_MAX_BLOCK_SIZE + 1)
+        position(position), height(LZ3_MAX_BLOCK_SIZE + 1)
     {
         prev = psa->rk[position];
         next = psa->rk[position] + 1;
     }
 
-    bool match_next(const LZ3_suffix_array* psa, uint32_t min_length, uint32_t max_distance)
+    bool match_next(const LZ3_suffix_array* psa, uint32_t min_length, uint32_t max_distance, uint32_t& length, uint32_t& offset)
     {
         while (true)
         {
@@ -259,20 +255,21 @@ public:
             }
             if (prev > 0 && (next >= psa->n || psa->height[prev] >= psa->height[next]))
             {
-                length = min(length, psa->height[prev]);
+                height = min(height, psa->height[prev]);
                 index = psa->sa[--prev];
             }
             else
             {
-                length = min(length, psa->height[next]);
+                height = min(height, psa->height[next]);
                 index = psa->sa[next++];
             }
-            if (length < min_length)
+            if (height < min_length)
             {
                 return false;
             }
             if (position > index && position - index <= max_distance)
             {
+                length = height;
                 offset = position - index;
                 return true;
             }
@@ -280,6 +277,8 @@ public:
     }
 
 private:
+    uint32_t position;
+    uint32_t height;  //当前遍历到的最小高度
     uint32_t prev;    //向前遍历到的后缀排名
     uint32_t next;    //向后遍历到的后缀排名
 };
@@ -404,14 +403,14 @@ public:
         blind_insert(chain, s, l, position);
     }
 
-    LZ3_match_node* match_insert(const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance)
+    bool match_insert(const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance, uint32_t& length, uint32_t& offset)
     {
         if (position + min_match_level > l)
         {
-            return nullptr;
+            return false;
         }
         auto& chain = chains[hash(s + position, min_match_level) % 4096];
-        return match_insert(chain, s, l, position, max_distance);
+        return match_insert(chain, s, l, position, max_distance, length, offset);
     }
 
 private:
@@ -437,7 +436,7 @@ private:
         return pp;
     }
     
-    LZ3_match_node* match_insert(vector<LZ3_match_node>& chain, const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance)
+    bool match_insert(vector<LZ3_match_node>& chain, const uint8_t* s, uint32_t l, uint32_t position, uint32_t max_distance, uint32_t& length, uint32_t& offset)
     {
         LZ3_match_node* pp = blind_insert(chain, s, l, position); //悬垂节点
         LZ3_match_node* ip = pp - pp->next; //遍历节点
@@ -445,7 +444,7 @@ private:
         LZ3_match_node* gt = nullptr; //出口链表尾部
         if (ip < ep || position - ip->position > max_distance)
         {
-            return nullptr;
+            return false;
         }
         for (uint32_t cl = min_match_level; ; cl++)
         {
@@ -453,23 +452,27 @@ private:
             LZ3_match_node* ct = nullptr; //本阶链表尾部
             LZ3_match_node* hh = nullptr; //高阶链表头部
             LZ3_match_node* ht = nullptr; //高阶链表尾部
+            uint32_t pl = l - position - cl; //提升阶数，高阶链表所有节点可提升阶数的最小值
             if (position + cl < l)
             {
-                uint32_t el = l - position - cl - 1; //额外阶数，高阶链表所有节点可额外提升阶数的最小值
                 while (true)
                 {
                     if (s[ip->position + cl] == s[position + cl])
                     {
-                        uint32_t ei = 1;
-                        while (ei <= el && s[ip->position + cl + ei] == s[position + cl + ei])
+                        uint32_t pi = 1;
+                        while (pi < pl && s[ip->position + cl + pi] == s[position + cl + pi])
                         {
-                            ei++;
+                            pi++;
                         }
-                        el = ei - 1;
-                        //遍历节点升阶
-                        if (ip->level < cl + 1)
+                        pl = pi;
+                        if (cl + pl >= l - position)
                         {
-                            ip->level = cl + 1;
+                            //匹配达到末尾，已经结束嘞。只会在循环开头出现这种情况
+                            gt = level_branch(gt, pp, ip);
+                            length = cl + pl;
+                            offset = position - ip->position;
+                            //函数提前返回
+                            return true;
                         }
                         //遍历节点进入高阶链表
                         if (hh == nullptr)
@@ -488,8 +491,8 @@ private:
                             if (in->level > cl)
                             {
                                 //后续节点就高于当前阶，next、gate都匹配，已经进入高阶链表，维持不变
-                                //额外提升阶数缩减
-                                el = min(el, in->level - cl - 1);
+                                //提升阶数缩减
+                                pl = min(pl, in->level - cl);
                                 //循环提前结束
                                 break;
                             }
@@ -522,8 +525,8 @@ private:
                                         ct = in;
                                     }
                                 }
-                                //额外提升阶数缩减
-                                el = min(el, ig->level - cl - 1);
+                                //提升阶数缩减
+                                pl = min(pl, ig->level - cl);
                                 //循环提前结束
                                 break;
                             }
@@ -572,21 +575,6 @@ private:
                         }
                     }
                 }
-                if (hh != nullptr && el > 0)
-                {
-                    //高阶链表非空，额外升阶
-                    ip = hh;
-                    while (ip >= ep)
-                    {
-                        assert(memcmp(s + ip->position, s + position, cl + 1 + el) == 0);
-                        if (ip->level < cl + 1 + el)
-                        {
-                            ip->level = cl + 1 + el;
-                        }
-                        ip = ip - ip->next;
-                    }
-                    cl += el;
-                }
             }
             else
             {
@@ -595,35 +583,57 @@ private:
             if (ch != nullptr)
             {
                 //本阶链表非空，节点分叉
-                if (gt == nullptr)
-                {
-                    pp->next = (int32_t)(pp - ch);
-                    gt = pp;
-                }
-                else
-                {
-                    if (gt == pp)
-                    {
-                        gt->gate = (int32_t)(gt - ch);
-                    }
-                    else
-                    {
-                        gt->high = (int32_t)(gt - ch);
-                    }
-                    gt = ch;
-                }
+                gt = level_branch(gt, pp, ch);
             }
             if (hh != nullptr && pp->position - hh->position <= max_distance)
             {
-                //高阶链表非空，循环继续
+                //高阶链表非空，升阶
+                level_promote(hh, ep, cl + pl);
+                //循环继续
                 ip = hh;
+                cl += pl - 1;
             }
             else
             {
-                return ch;
+                length = ch->level;
+                offset = position - ch->position;
+                return true;
             }
         }
-        return nullptr;
+        return false;
+    }
+
+    LZ3_match_node* level_branch(LZ3_match_node* gt, LZ3_match_node* pp, LZ3_match_node* ch)
+    {
+        if (gt == nullptr)
+        {
+            pp->next = (int32_t)(pp - ch);
+            return pp;
+        }
+        else
+        {
+            if (gt == pp)
+            {
+                gt->gate = (int32_t)(gt - ch);
+            }
+            else
+            {
+                gt->high = (int32_t)(gt - ch);
+            }
+            return ch;
+        }
+    }
+
+    void level_promote(LZ3_match_node* ip, LZ3_match_node* ep, uint32_t level)
+    {
+        while (ip >= ep)
+        {
+            if (ip->level < level)
+            {
+                ip->level = level;
+            }
+            ip = ip - ip->next;
+        }
     }
 };
 
@@ -1973,26 +1983,20 @@ static vector<LZ3_match_info> LZ3_compress_opt(
     {
         bool matched = false;
         LZ3_match_info match;
-        LZ3_match_iter startingMatch(psa, i + saHis);
+        match.position = i;
         if (pmc != nullptr)
         {
-            const LZ3_match_node* highestMatch = pmc->match_insert(src - mcHis, srcSize + mcHis, i + mcHis, max_distance);
-            if (highestMatch != nullptr)
+            if (pmc->match_insert(src - mcHis, srcSize + mcHis, i + mcHis, max_distance, match.length, match.offset))
             {
                 matched = true;
-                match.position = i;
-                match.length = highestMatch->level;
-                match.offset = i + mcHis - highestMatch->position;
             }
         }
+        LZ3_match_iter startingMatch(psa, i + saHis);
         if (!matched)
         {
-            if (startingMatch.match_next(psa, min_match_length, max_distance))
+            if (startingMatch.match_next(psa, min_match_length, max_distance, match.length, match.offset))
             {
                 matched = true;
-                match.position = i;
-                match.length = startingMatch.length;
-                match.offset = startingMatch.offset;
             }
         }
         uint32_t lastPos = 0;
@@ -2043,17 +2047,14 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                             optimal[k].price = price;
                         }
                     }
-                    if (startingMatch.match_next(psa, min_match_length, max_distance))
-                    {
-                        assert(startingMatch.length <= match.length);
-                        match.position = startingMatch.position - saHis;
-                        match.length = startingMatch.length;
-                        match.offset = startingMatch.offset;
-                    }
-                    else
+                    uint32_t sl, so;
+                    if (!startingMatch.match_next(psa, min_match_length, max_distance, sl, so))
                     {
                         break;
                     }
+                    assert(sl <= match.length);
+                    match.length = sl;
+                    match.offset = so;
                 }
             }
             for (uint32_t j = 1; j <= lastPos; ++j)
@@ -2096,42 +2097,43 @@ static vector<LZ3_match_info> LZ3_compress_opt(
                     LZ3_match_iter furtherMatch(psa, i + saHis + j);
                     for (uint32_t furtherCount = 0; furtherCount < match_count; ++furtherCount)
                     {
-                        if (!furtherMatch.match_next(psa, furtherLength, max_distance))
+                        uint32_t fl, fo;
+                        if (!furtherMatch.match_next(psa, furtherLength, max_distance, fl, fo))
                         {
                             break;
                         }
-                        if (j + furtherMatch.length > lastPos)
+                        if (j + fl > lastPos)
                         {
-                            lastPos = j + furtherMatch.length;
-                            if (furtherMatch.length > sufficient_length)
+                            lastPos = j + fl;
+                            if (fl > sufficient_length)
                             {
-                                lastMatch.position = furtherMatch.position - saHis;
-                                lastMatch.offset = furtherMatch.offset;
-                                lastMatch.length = furtherMatch.length;
+                                lastMatch.position = i + j;
+                                lastMatch.offset = fo;
+                                lastMatch.length = fl;
                                 lastMatch.literal = lLen;
                                 goto sufficient_short_path;
                             }
                             optimal.resize(lastPos + 1);
                         }
-                        uint32_t mop = mOffPrice(furtherMatch.offset, optimal[j].preOff);
+                        uint32_t mop = mOffPrice(fo, optimal[j].preOff);
                         if (mop == numeric_limits<uint32_t>::max() || mop >= mopBest)
                         {
                             continue;
                         }
                         mopBest = mop;
-                        for (uint32_t k = furtherMatch.length; k >= min_match_length; --k)
+                        for (uint32_t k = fl; k >= min_match_length; --k)
                         {
                             uint32_t mlp = mLenPrice(k);
                             int64_t price = llp + mlp + mop;
                             if (price < optimal[j + k].price)
                             {
-                                optimal[j + k].position = furtherMatch.position - saHis;
+                                optimal[j + k].position = i + j;
                                 optimal[j + k].length = k;
-                                optimal[j + k].offset = furtherMatch.offset;
+                                optimal[j + k].offset = fo;
                                 optimal[j + k].literal = lLen;
                                 optimal[j + k].preOff[2] = optimal[j].preOff[1];
                                 optimal[j + k].preOff[1] = optimal[j].preOff[0];
-                                optimal[j + k].preOff[0] = furtherMatch.offset;
+                                optimal[j + k].preOff[0] = fo;
                                 optimal[j + k].price = price;
                             }
                         }
