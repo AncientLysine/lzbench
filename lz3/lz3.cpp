@@ -3582,7 +3582,7 @@ uint32_t LZ3_compress_continue_generic(LZ3_CStream* pcs, const void* src, void* 
         }
         memcpy(pcs->psz, srcPtr, curSize);
         srcPtr += curSize;
-        dstPtr += LZ3_compress_generic<coder>(pcs->psz, dstPtr, curSize, params, &pcs->hsa, &pcs->tsa, &pcs->hmc);
+        dstPtr += LZ3_compress_generic<coder>(pcs->psz, dstPtr, curSize, params, &pcs->hsa, &pcs->tsa, srcSize > LZ3_MAX_ARRAY_DISTANCE ? &pcs->hmc : nullptr);
         pcs->psz += curSize;
     }
     return (uint32_t)(dstPtr - (uint8_t*)dst);
