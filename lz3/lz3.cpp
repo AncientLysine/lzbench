@@ -4,8 +4,9 @@
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <unordered_map>
 #include <vector>
+#include <list>
+#include <unordered_map>
 #include <iterator>
 
 #define LZ3_LIBRARY
@@ -16,10 +17,6 @@
 #include "zstd/lib/common/huf.h"
 #define FSE_STATIC_LINKING_ONLY
 #include "zstd/lib/common/fse.h"
-
-#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
-#include <arm_neon.h>
-#endif
 
 #if !defined(NDEBUG) && (defined(LZ3_LOG_SA) || defined(LZ3_LOG_SEQ))
 #include <sstream>
@@ -363,7 +360,6 @@ enum class LZ3_stream_flag : uint8_t
     RunLength   = 8,
     Huff0       = 16,
     FSE         = 32,
-    MergedPiece = 64,
 };
 
 enum class LZ3_history_pos
@@ -386,6 +382,21 @@ LZ3_FORCE_INLINE static constexpr bool operator&(LZ3_compress_flag lhs, LZ3_comp
 {
     return (static_cast<uint8_t>(lhs) & static_cast<uint8_t>(rhs)) > 0;
 }
+
+struct LZ3_block_stream
+{
+    union
+    {
+        struct
+        {
+            uint16_t position;
+            uint16_t head;
+            uint16_t next;
+            uint16_t length;
+        };
+        uint64_t packed;
+    };
+};
 
 #define LZ3_MAX_LL 34u
 
@@ -585,6 +596,8 @@ struct LZ3_CCtx
             uint8_t of_bits[64];
             uint8_t of_size;
             uint32_t preOff[3];
+            uint16_t blockLayout;
+            uint16_t predictMask;
         };
     };
 };
@@ -608,6 +621,10 @@ struct LZ3_DCtx
             uint8_t of_size;
             BIT_DStream_t bitStr;
             uint32_t preOff[3];
+            LZ3_block_stream blockStr[16];
+            uint16_t predictMask;
+            uint32_t predictDis;
+            uint8_t* predictSta;
         };
     };
 };
@@ -903,7 +920,7 @@ __attribute__((aarch64_vector_pcs))
 #endif
 typedef LZ3_decode_of_result(*LZ3_of_decoder)(const uint8_t* seqPtr, LZ3_DCtx& dctx);
 
-static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockSize, uint32_t lineSize)
+LZ3_NO_INLINE static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockSize, uint32_t lineSize)
 {
     switch ((uint8_t)flag & 7)
     {
@@ -982,6 +999,174 @@ static LZ3_of_decoder LZ3_gen_of_decoder(LZ3_compress_flag flag, uint32_t blockS
     default:
         LZ3_UNREACHABLE;
     }
+}
+
+#if defined(_WIN64)
+struct LZ3_decode_ls_result
+{
+    const uint8_t* getSrcPtr(const uint8_t* srcPtr)
+    {
+        return (const uint8_t*)(uintptr_t)rax;
+    }
+
+    void setSrcPtr(const uint8_t* srcPtr)
+    {
+        rax = (size_t)(uintptr_t)srcPtr;
+    }
+
+    size_t rax;
+};
+#else
+struct LZ3_decode_ls_result
+{
+    const uint8_t* getSrcPtr(const uint8_t*)
+    {
+        return (const uint8_t*)(uintptr_t)rax;
+    }
+
+    void setSrcPtr(const uint8_t* srcPtr)
+    {
+        rax = (size_t)(uintptr_t)srcPtr;
+    }
+
+    size_t rax;
+    //size_t rdx;
+};
+#endif
+
+template<uint32_t blockSize, uint32_t wildLen>
+LZ3_FORCE_INLINE static void LZ3_decode_ls_block(uint8_t* dstPtr, const uint8_t* srcPtr, size_t literal, LZ3_DCtx& dctx)
+{
+    uint32_t b = blockSize;
+    if LZ3_CONSTEXPRIF(blockSize == 0)
+        b = dctx.blockSize;
+    uint8_t* cpyPtr = dstPtr;
+    size_t cpyLen = literal;
+    size_t blockIdx = (uintptr_t)cpyPtr % b;
+    LZ3_block_stream blockStr;
+    blockStr.packed = dctx.blockStr[blockIdx].packed;
+    size_t blockHead = blockStr.head;
+    size_t blockPos = dctx.blockStr[blockHead].position;
+    memcpy(cpyPtr, srcPtr + blockPos, wildLen);
+    size_t blockLen = min(cpyLen, (size_t)blockStr.length);
+    dctx.blockStr[blockHead].position = (uint16_t)(blockPos + blockLen);
+    cpyPtr += blockLen;
+    cpyLen -= blockLen;
+    while (cpyLen > 0)
+    {
+        blockIdx = blockStr.next;
+        blockStr.packed = dctx.blockStr[blockIdx].packed;
+        blockPos = blockStr.position;
+        memcpy(cpyPtr, srcPtr + blockPos, wildLen);
+        blockLen = min(cpyLen, (size_t)blockStr.length);
+        dctx.blockStr[blockIdx].position = (uint16_t)(blockPos + blockLen);
+        cpyPtr += blockLen;
+        cpyLen -= blockLen;
+    }
+}
+
+template<uint32_t blockSize, uint32_t wildLen>
+static LZ3_decode_ls_result LZ3_decode_ls_block_wrapper(uint8_t* dstPtr, const uint8_t* srcPtr, size_t literal, LZ3_DCtx& dctx)
+{
+    LZ3_decode_ls_block<blockSize, wildLen>(dstPtr, srcPtr, literal, dctx);
+    LZ3_decode_ls_result result;
+    result.setSrcPtr(srcPtr);
+    return result;
+}
+
+template<uint32_t blockSize, uint32_t predictMask, typename P, typename R>
+LZ3_FORCE_INLINE static void LZ3_decode_ls_predict(uint8_t* dstPtr, const uint8_t* srcPtr, size_t literal, LZ3_DCtx& dctx, P prdReader, R rawReader)
+{
+    uint32_t b = blockSize;
+    uint32_t m = predictMask;
+    if LZ3_CONSTEXPRIF(blockSize == 0)
+        b = dctx.blockSize;
+    if LZ3_CONSTEXPRIF(predictMask == 0)
+        m = dctx.predictMask;
+    uint8_t* cpyPtr = dstPtr;
+    uint8_t* cpyEnd = dstPtr + literal;
+    uint8_t* prdSta = dctx.predictSta;
+    while (cpyPtr < cpyEnd)
+    {
+        if (cpyPtr >= prdSta && ((blockSize != 0 && (1 << blockSize) == predictMask + 1) || (m & (1 << ((uintptr_t)cpyPtr % b)))))
+        {
+            prdReader(cpyPtr);
+        }
+        else
+        {
+            rawReader(cpyPtr);
+        }
+        ++cpyPtr;
+    }
+}
+
+template<uint32_t blockSize, uint32_t predictMask, uint32_t predictDis>
+static LZ3_decode_ls_result LZ3_decode_ls_predict_wrapper(uint8_t* dstPtr, const uint8_t* srcPtr, size_t literal, LZ3_DCtx& dctx)
+{
+    uint32_t d = predictDis;
+    if LZ3_CONSTEXPRIF(predictDis == 0)
+        d = dctx.predictDis;
+    LZ3_decode_ls_predict<blockSize, predictMask>(dstPtr, srcPtr, literal, dctx,
+        [&](uint8_t* cpyPtr) { *cpyPtr = *(srcPtr++) + *(cpyPtr - d); },
+        [&](uint8_t* cpyPtr) { *cpyPtr = *(srcPtr++); });
+    LZ3_decode_ls_result result;
+    result.setSrcPtr(srcPtr);
+    return result;
+}
+
+template<uint32_t blockSize, uint32_t wildLen, uint32_t predictMask, uint32_t predictDis>
+static LZ3_decode_ls_result LZ3_decode_ls_block_predict_wrapper(uint8_t* dstPtr, const uint8_t* srcPtr, size_t literal, LZ3_DCtx& dctx)
+{
+    uint32_t d = predictDis;
+    if LZ3_CONSTEXPRIF(predictDis == 0)
+        d = dctx.predictDis;
+    LZ3_decode_ls_block<blockSize, wildLen>(dstPtr, srcPtr, literal, dctx);
+    LZ3_decode_ls_predict<blockSize, predictMask>(dstPtr, srcPtr, literal, dctx,
+        [&](uint8_t* cpyPtr) { *cpyPtr += *(cpyPtr - d); },
+        [&](uint8_t* cpyPtr) {});
+    LZ3_decode_ls_result result;
+    result.setSrcPtr(srcPtr);
+    return result;
+}
+
+typedef LZ3_decode_ls_result(*LZ3_ls_decoder)(uint8_t* dstPtr, const uint8_t* srcPtr, size_t literal, LZ3_DCtx& dctx);
+
+LZ3_NO_INLINE static LZ3_ls_decoder gen_ls_decoder(LZ3_compress_flag flag, uint32_t blockSize, uint16_t blockLayout, uint16_t predictMask, uint32_t predictDis)
+{
+    switch ((uint8_t)flag & 24)
+    {
+    case 0:
+        break;
+    case 8:
+        if (blockSize == 3)
+            return &LZ3_decode_ls_block_wrapper<3,  4>;
+        if (blockSize == 4)
+            return &LZ3_decode_ls_block_wrapper<4,  4>;
+        if (blockSize == 8)
+            return &LZ3_decode_ls_block_wrapper<8,  8>;
+        if (blockSize == 16)
+            return &LZ3_decode_ls_block_wrapper<16, 16>;
+        return &LZ3_decode_ls_block_wrapper<0, 16>;
+    case 16:
+        return &LZ3_decode_ls_predict_wrapper<0, 0, 0>;
+    case 24:
+        if (blockSize == 3  && predictMask == 0x0007 && predictDis == 3)
+            return &LZ3_decode_ls_block_predict_wrapper<3,  4,  0x0007, 3>;
+        if (blockSize == 4  && predictMask == 0x000F && predictDis == 4)
+            return &LZ3_decode_ls_block_predict_wrapper<4,  4,  0x000F, 4>;
+        if (blockSize == 8  && predictMask == 0x00FF && predictDis == 8)
+            return &LZ3_decode_ls_block_predict_wrapper<8,  8,  0x00FF, 8>;
+        if (blockSize == 16 && predictMask == 0xFFFF && predictDis == 16)
+            return &LZ3_decode_ls_block_predict_wrapper<16, 16, 0xFFFF, 16>;
+        if (blockSize == 8  && predictDis == 8)
+            return &LZ3_decode_ls_block_predict_wrapper<8,  8,  0, 8>;
+        if (blockSize == 16 && predictDis == 16)
+            return &LZ3_decode_ls_block_predict_wrapper<16, 16, 0, 16>;
+        return &LZ3_decode_ls_block_predict_wrapper<0, 16, 0, 0>;
+    default:
+        LZ3_UNREACHABLE;
+    }
+    return nullptr;
 }
 
 #define LZ3_BIT_COST_ACC 8u
@@ -1166,6 +1351,21 @@ struct LZ3_chunk_fse
         eval_size();
     }
 
+    LZ3_chunk_fse(const LZ3_code_hist& codeHist, uint8_t codeBound) :
+        codeHist(codeHist)
+    {
+        codeMax = 0;
+        for (uint8_t c = codeBound; c > 0; --c)
+        {
+            if (codeHist.data()[c] > 0)
+            {
+                codeMax = c;
+                break;
+            }
+        }
+        eval_size();
+    }
+
     LZ3_chunk_fse(const LZ3_chunk_fse& a, const LZ3_chunk_fse& b) :
         codeHist(a.codeHist.merge(b.codeHist)), codeMax(max(a.codeMax, b.codeMax))
     {
@@ -1215,51 +1415,71 @@ struct LZ3_chunk_fse
     }
 };
 
-static constexpr uint8_t merge_idx[][16] =
+template<typename ChunkType>
+struct LZ3_chunk_merged : ChunkType
 {
-    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
-    { 0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15 },
-    { 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15 },
-    { 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15 },
-    { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    vector<size_t> sources;
+
+    LZ3_chunk_merged(const ChunkType& chunk, size_t index) :
+        ChunkType(chunk)
+    {
+        sources.push_back(index);
+    }
+
+    LZ3_chunk_merged(const LZ3_chunk_merged& a, const LZ3_chunk_merged& b) :
+        ChunkType(a, b)
+    {
+        sources.insert(sources.end(), a.sources.begin(), a.sources.end());
+        sources.insert(sources.end(), b.sources.begin(), b.sources.end());
+    }
 };
 
 template<typename ChunkType>
-static void LZ3_merge_chunks(vector<ChunkType>& chunks)
+static vector<uint8_t> LZ3_merge_chunks(vector<ChunkType>& chunks)
 {
+    list<LZ3_chunk_merged<ChunkType>> merged;
+    for (size_t i = 0; i < chunks.size(); ++i)
+    {
+        merged.emplace_back(chunks[i], i);
+    }
     while (true)
     {
-        size_t newSize = 0;
-        for (size_t i = 0; i < chunks.size();)
+        size_t oldSize = merged.size();
+        for (auto it = merged.begin(); it != merged.end();)
         {
-            const ChunkType& ec = chunks[i];
-            if (i + 1 >= chunks.size())
+            auto cc = it++;
+            auto nc = it;
+            if (nc == merged.end())
             {
-                chunks[newSize++] = ec;
-                break;
+                nc = cc;
+                cc = merged.begin();
             }
-            const ChunkType& oc = chunks[i + 1];
-            ChunkType mc(ec, oc);
-            if (min(mc.estimate_size(), mc.fallback_size()) <= min(ec.estimate_size(), ec.fallback_size()) + min(oc.estimate_size(), oc.fallback_size()))
+            LZ3_chunk_merged<ChunkType> mc(*cc, *nc);
+            if (min(mc.estimate_size(), mc.fallback_size()) <= min(cc->estimate_size(), cc->fallback_size()) + min(nc->estimate_size(), nc->fallback_size()))
             {
-                chunks[newSize++] = mc;
-                i += 2;
-            }
-            else
-            {
-                chunks[newSize++] = ec;
-                i += 1;
+                *cc = mc;
+                it = merged.erase(nc);
             }
         }
-        if (newSize != chunks.size())
-        {
-            chunks.erase(chunks.begin() + newSize, chunks.end());
-        }
-        else
+        size_t newSize = merged.size();
+        if (newSize == oldSize || newSize == 1)
         {
             break;
         }
     }
+    vector<uint8_t> splits(chunks.size());
+    chunks.erase(chunks.begin() + merged.size(), chunks.end());
+    uint8_t index = 0;
+    for (const LZ3_chunk_merged<ChunkType>& m : merged)
+    {
+        chunks[index] = m;
+        for (size_t s : m.sources)
+        {
+            splits[s] = index;
+        }
+        ++index;
+    }
+    return splits;
 }
 
 static LZ3_compress_flag LZ3_detect_offset_flags(const vector<LZ3_match_info>& matches, LZ3_CCtx& cctx)
@@ -1300,7 +1520,7 @@ static LZ3_compress_flag LZ3_detect_offset_flags(const vector<LZ3_match_info>& m
     }
     int64_t bestPrice = codePrice;
     //consider only block of 3(RGB24), 4(RGB32), 8(ETC1), 16(ETC2/ASTC) bytes
-    cctx.blockSize = 0;
+    cctx.blockSize = 1;
     cctx.blockLog = 0;
     int64_t blk2Thres = bestPrice * cctx.params[LZ3_compress_param::OffBlockModeThreshold] / 100 - cctx.params[LZ3_compress_param::OffBlockModeIntercept] * 8 * LZ3_BIT_COST_MUL;
     static constexpr uint32_t usualBlockSize[] = { 3, 4, 8, 16 };
@@ -1421,7 +1641,53 @@ static LZ3_compress_flag LZ3_detect_offset_flags(const vector<LZ3_match_info>& m
     return flag;
 }
 
-static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vector<pair<uint32_t, uint32_t>>& slices, LZ3_CCtx& cctx, vector<uint8_t>& stream, vector<size_t>& pieces, vector<LZ3_chunk_huf>& chunks)
+struct LZ3_chunk_pattern
+{
+    uint32_t bits;
+    uint32_t quant;
+    uint32_t count;
+    uint32_t index;
+    uint8_t(*predict)(const uint8_t*, uint32_t);
+};
+
+struct LZ3_layout_pattern
+{
+    vector<LZ3_chunk_pattern> chunks;
+    bool(*filter)(const uint8_t*);
+};
+
+struct LZ3_literal_pattern
+{
+    uint32_t blockSize;
+    vector<LZ3_layout_pattern> layouts;
+};
+
+static LZ3_literal_pattern lp_list[]
+{
+    {8, {{{{8, 256, 3, 0}, {8, 256, 1, 1}, {8, 256, 4, 2}}}}},
+    {8, {{{{8, 256, 3, 0}, {8, 256, 1, 1}, {8, 256, 2, 2}, {8, 256, 2, 3}}}}},
+    {8, {{{{8, 256, 3, 0, [](const uint8_t* s, uint32_t o) { return (uint8_t)(o >= 64 ? s[(o - 64) / 8] : 0); }}, {8, 256, 1, 1}, {8, 256, 4, 2}}}}},
+    {8, {{{{8, 256, 3, 0, [](const uint8_t* s, uint32_t o) { return (uint8_t)(o >= 64 ? s[(o - 64) / 8] : 0); }}, {8, 256, 1, 1}, {8, 256, 2, 2}, {8, 256, 2, 3}}}}},
+    //{8, {{{{8, 256, 3, 0}, {3, 8, 2, 1}, {2, 4, 1, 2}, {8, 256, 4, 3}}}}},
+    //{8, {{{{8, 256, 3, 0}, {3, 8, 2, 1}, {2, 4, 1, 2}, {8, 256, 2, 3}, {8, 256, 2, 4}}}}},
+    //{8, {{{{8, 256, 3, 0}, {3, 8, 2, 1}, {2, 4, 1, 2}, {1, 2, 32, 3}}}}},
+    //{8, {{{{8, 256, 3, 0}, {3, 8, 2, 1}, {2, 4, 1, 2}, {1, 2, 16, 3}, {1, 2, 16, 4}}}}},
+    {
+        16,
+        {
+            {{{8, 256, 1, 0}, {8, 256, 1, 1}, {8, 256, 1, 2}, {8, 256, 4, 3}, {8, 256, 9, 4}}}
+        }
+    },
+    {
+        16,
+        {
+            {{{8, 256, 1, 0}, {8, 256, 1, 1}, {8, 256, 4, 3}, {8, 256, 10, 5}}, [](const uint8_t* b) { return (b[1] & 0b11000) == 0; }},
+            {{{8, 256, 1, 0}, {8, 256, 1, 1}, {8, 256, 1, 2}, {8, 256, 4, 4}, {8, 256, 9, 5}}, [](const uint8_t* b) { return (b[1] & 0b11000) != 0; }}
+        }
+    },
+};
+
+static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vector<pair<uint32_t, uint32_t>>& slices, LZ3_CCtx& cctx, vector<uint8_t>& stream, vector<LZ3_chunk_huf>& chunks)
 {
     LZ3_compress_flag flag = LZ3_compress_flag::None;
     stream.clear();
@@ -1433,10 +1699,11 @@ static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vect
         }
     }
     LZ3_chunk_huf rawChunk(stream.data(), stream.size());
-    pieces = { stream.size() };
     chunks = { rawChunk };
     int64_t origSize = (int64_t)min(rawChunk.estimate_size(), rawChunk.fallback_size());
     int64_t bestSize = origSize;
+    //consider block
+    cctx.blockLayout = 0;
     int64_t blkThres = origSize * cctx.params[LZ3_compress_param::LitBlockModeThreshold] / 100 - cctx.params[LZ3_compress_param::LitBlockModeIntercept];
     do
     {
@@ -1444,150 +1711,258 @@ static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vect
         {
             break;
         }
-        if (cctx.blockSize > 16 || cctx.blockSize != (1u << cctx.blockLog))
+        if (cctx.blockSize > 16)
         {
             break;
         }
-        vector<uint8_t> lbs[16];
+        vector<LZ3_code_hist> blkHist(cctx.blockSize);
         for (const auto& p : slices)
         {
             for (uint32_t i = p.first; i < p.first + p.second; ++i)
             {
-                lbs[i % 16].push_back(src[i]);
+                blkHist[i % cctx.blockSize].inc_stats(src[i]);
             }
         }
-        vector<LZ3_chunk_huf> blkChunk;
-        for (uint32_t i = 0; i < 16; ++i)
+        vector<LZ3_chunk_huf> blkChunks;
+        for (uint32_t i = 0; i < cctx.blockSize; ++i)
         {
-            uint32_t mi = merge_idx[cctx.blockLog][i];
-            blkChunk.emplace_back(lbs[mi].data(), lbs[mi].size());
+            blkChunks.emplace_back(blkHist[i], 255);
         }
-        LZ3_merge_chunks(blkChunk);
-        if (blkChunk.size() == 1)
+        vector<uint8_t> blkSplits = LZ3_merge_chunks(blkChunks);
+        if (blkChunks.size() == 1)
         {
             break;
         }
         int64_t blkSize = 0;
-        for (const LZ3_chunk_huf& chunk : blkChunk)
+        for (const LZ3_chunk_huf& c : blkChunks)
         {
-            blkSize += (int64_t)chunk.estimate_size();
+            blkSize += (int64_t)min(c.estimate_size(), c.fallback_size());
         }
         if (blkSize < blkThres && blkSize < bestSize)
         {
-            flag = LZ3_compress_flag::LiteralBlock;
+            flag = flag | LZ3_compress_flag::LiteralBlock;
             bestSize = blkSize;
-            stream.clear();
-            pieces.clear();
-            for (uint32_t i = 0; i < 16; ++i)
+            for (size_t i = 0; i < blkSplits.size(); ++i)
             {
-                uint32_t mi = merge_idx[cctx.blockLog][i];
-                stream.insert(stream.end(), lbs[mi].begin(), lbs[mi].end());
-                pieces.push_back(lbs[mi].size());
+                if (blkSplits[i] != blkSplits[(i == 0 ? blkSplits.size() : i) - 1])
+                {
+                    cctx.blockLayout |= 1 << i;
+                }
             }
-            chunks = move(blkChunk);
+            vector<vector<uint8_t>> blkStreams(blkChunks.size());
+            for (const auto& p : slices)
+            {
+                for (uint32_t i = p.first; i < p.first + p.second; ++i)
+                {
+                    blkStreams[blkSplits[i % cctx.blockSize]].push_back(src[i]);
+                }
+            }
+            stream.clear();
+            for (const vector<uint8_t>& s : blkStreams)
+            {
+                stream.insert(stream.end(), s.begin(), s.end());
+            }
+            chunks = blkChunks;
         }
     }
     while (false);
-    uint32_t prdDis = 1;
-    if (cctx.flag & LZ3_compress_flag::OffsetBlock)
-    {
-        prdDis = cctx.blockSize;
-    }
-    /*if (cctx.flag & LZ3_compress_flag::OffsetTwoDim)
-    {
-        prdDis *= cctx.lineSize;
-    }*/
-    int64_t prdThres = origSize * cctx.params[LZ3_compress_param::LitPredictModeThreshold] / 100 - cctx.params[LZ3_compress_param::LitPredictModeIntercept];
-    {
-        vector<uint8_t> lps;
-        for (const auto& p : slices)
-        {
-            for (uint32_t i = p.first; i < p.first + p.second; ++i)
-            {
-                uint8_t l = src[i];
-                if (i >= prdDis)
-                {
-                    l -= src[i - prdDis];
-                }
-                lps.push_back(l);
-            }
-        }
-        LZ3_chunk_huf prdChunk(lps.data(), lps.size());
-        int64_t prdSize = (int64_t)prdChunk.estimate_size();
-        if (prdSize < prdThres && prdSize < bestSize)
-        {
-            flag = LZ3_compress_flag::LiteralPredict;
-            bestSize = prdSize;
-            stream = lps;
-            pieces = { lps.size() };
-            chunks = { prdChunk };
-        }
-    }
-    //consider blk&prd
-    int64_t bapThres = bestSize;
+    //consider predict
+    cctx.predictMask = 0;
+    int64_t prdThres = bestSize * cctx.params[LZ3_compress_param::LitPredictModeThreshold] / 100 - cctx.params[LZ3_compress_param::LitPredictModeIntercept];
     do
     {
-        if (!(cctx.flag & LZ3_compress_flag::OffsetBlock))
+        uint32_t blkMod = 1;
+        uint32_t prdDis = 1;
+        if (cctx.flag & LZ3_compress_flag::OffsetBlock)
         {
-            break;
+            blkMod = cctx.blockSize <= 16 ? cctx.blockSize : 1;
+            prdDis = cctx.blockSize;
         }
-        if (cctx.blockSize > 16 || cctx.blockSize != (1u << cctx.blockLog))
+        /*if (cctx.flag & LZ3_compress_flag::OffsetTwoDim)
         {
-            break;
-        }
-        if (!(flag & LZ3_compress_flag::LiteralBlock))
-        {
-            bapThres = bapThres * cctx.params[LZ3_compress_param::LitBlockModeThreshold]   / 100 - cctx.params[LZ3_compress_param::LitBlockModeIntercept];
-        }
-        if (!(flag & LZ3_compress_flag::LiteralPredict))
-        {
-            bapThres = bapThres * cctx.params[LZ3_compress_param::LitPredictModeThreshold] / 100 - cctx.params[LZ3_compress_param::LitPredictModeIntercept];
-        }
-        vector<uint8_t> bap[16];
+            prdDis *= cctx.lineSize;
+        }*/
+        vector<LZ3_code_hist> blkHist(blkMod);
+        vector<LZ3_code_hist> prdHist(blkMod);
         for (const auto& p : slices)
         {
             for (uint32_t i = p.first; i < p.first + p.second; ++i)
             {
                 uint8_t l = src[i];
+                blkHist[i % blkMod].inc_stats(l);
                 if (i >= prdDis)
                 {
                     l -= src[i - prdDis];
                 }
-                bap[i % 16].push_back(l);
+                prdHist[i % blkMod].inc_stats(l);
             }
         }
-        vector<LZ3_chunk_huf> bapChunk;
-        for (uint32_t i = 0; i < 16; ++i)
+        for (uint32_t i = 0; i < blkMod; ++i)
         {
-            uint32_t mi = merge_idx[cctx.blockLog][i];
-            bapChunk.emplace_back(bap[mi].data(), bap[mi].size());
+            size_t blkPrice = 0;
+            size_t prdPrice = 0;
+            for (size_t c = 0; c < 256; ++c)
+            {
+                blkPrice += (size_t)blkHist[i].eval_cost((uint8_t)c) * blkHist[i].data()[c];
+                prdPrice += (size_t)prdHist[i].eval_cost((uint8_t)c) * prdHist[i].data()[c];
+            }
+            if (prdPrice < blkPrice)
+            {
+                cctx.predictMask |= 1 << i;
+            }
         }
-        LZ3_merge_chunks(bapChunk);
-        if (bapChunk.size() == 1)
+        if (cctx.predictMask == 0)
         {
             break;
         }
-        int64_t bapSize = 0;
-        for (const LZ3_chunk_huf& chunk : bapChunk)
+        vector<LZ3_chunk_huf> prdChunks;
+        for (uint32_t i = 0; i < blkMod; ++i)
         {
-            bapSize += (int64_t)chunk.estimate_size();
-        }
-        if (bapSize < bapThres)
-        {
-            flag = LZ3_compress_flag::LiteralBlock | LZ3_compress_flag::LiteralPredict;
-            bestSize = bapSize;
-            stream.clear();
-            pieces.clear();
-            for (uint32_t i = 0; i < 16; ++i)
+            if (cctx.predictMask & (1 << i))
             {
-                uint32_t mi = merge_idx[cctx.blockLog][i];
-                stream.insert(stream.end(), bap[mi].begin(), bap[mi].end());
-                pieces.push_back(bap[mi].size());
+                prdChunks.emplace_back(prdHist[i], 255);
             }
-            chunks = move(bapChunk);
+            else
+            {
+                prdChunks.emplace_back(blkHist[i], 255);
+            }
+        }
+        vector<uint8_t> prdSplits;
+        if (blkMod > 1)
+        {
+            prdSplits = LZ3_merge_chunks(prdChunks);
+        }
+        else
+        {
+            prdSplits = { 0 };
+        }
+        int64_t prdSize = 0;
+        for (const LZ3_chunk_huf& c : prdChunks)
+        {
+            prdSize += (int64_t)min(c.estimate_size(), c.fallback_size());
+        }
+        if (prdSize < prdThres && prdSize < bestSize)
+        {
+            flag = flag | LZ3_compress_flag::LiteralPredict;
+            bestSize = prdSize;
+            if (prdChunks.size() > 1)
+            {
+                flag = flag | LZ3_compress_flag::LiteralBlock;
+                cctx.blockLayout = 0;
+                for (size_t i = 0; i < prdSplits.size(); ++i)
+                {
+                    if (prdSplits[i] != prdSplits[(i == 0 ? prdSplits.size() : i) - 1])
+                    {
+                        cctx.blockLayout |= 1 << i;
+                    }
+                }
+            }
+            vector<vector<uint8_t>> prdStreams(prdChunks.size());
+            for (const auto& p : slices)
+            {
+                for (uint32_t i = p.first; i < p.first + p.second; ++i)
+                {
+                    uint8_t l = src[i];
+                    if (i >= prdDis && (cctx.predictMask & (1 << (i % blkMod))))
+                    {
+                        l -= src[i - prdDis];
+                    }
+                    prdStreams[prdSplits[i % blkMod]].push_back(l);
+                }
+            }
+            stream.clear();
+            for (const vector<uint8_t>& s : prdStreams)
+            {
+                stream.insert(stream.end(), s.begin(), s.end());
+            }
+            chunks = prdChunks;
         }
     }
     while (false);
+    //consider well-defined literal patterns(ETC1, ETC2, ASTC)
+    for (const LZ3_literal_pattern& lp : lp_list)
+    {
+        if (lp.blockSize != cctx.blockSize)
+        {
+            continue;
+        }
+        uint32_t maxIndex = 0;
+        for (const LZ3_layout_pattern& ap : lp.layouts)
+        {
+            for (const LZ3_chunk_pattern& cp : ap.chunks)
+            {
+                maxIndex = max(maxIndex, cp.index);
+            }
+        }
+        vector<vector<uint8_t>> lps(maxIndex + 1);
+        for (const auto& p : slices)
+        {
+            uint32_t blkSta = p.first - p.first % lp.blockSize;
+            for (const LZ3_layout_pattern& ap : lp.layouts)
+            {
+                if (ap.filter == nullptr || ap.filter(src + blkSta))
+                {
+                    uint32_t bitOff = blkSta * 8; //bit offset
+                    uint32_t bitSta = p.first * 8; //bit start
+                    uint32_t bitEnd = bitSta + p.second * 8; //bit end
+                    for (uint32_t j = 0; ; j = (j + 1) % ap.chunks.size())
+                    {
+                        const LZ3_chunk_pattern& cp = ap.chunks[j];
+                        for (uint32_t k = 0; k < cp.count; ++k)
+                        {
+                            if (bitOff + cp.bits <= bitSta)
+                            {
+                                bitOff += cp.bits;
+                                continue;
+                            }
+                            if (bitOff < bitEnd)
+                            {
+                                uint32_t l = LZ3_extract_bits(src, bitOff, cp.bits);
+                                if (cp.predict != nullptr)
+                                {
+                                    l -= cp.predict(src, bitOff);
+                                }
+                                lps[cp.index].push_back(l % cp.quant);
+                                bitOff += cp.bits;
+                            }
+                        }
+                        if (bitOff >= bitEnd)
+                        {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        vector<LZ3_chunk_huf> hufChunk;
+        vector<LZ3_chunk_fse> fseChunk;
+        int64_t blkSize = 0;
+        for (uint32_t i = 0; i <= maxIndex; ++i)
+        {
+            LZ3_code_hist codeHist;
+            uint8_t codeMax = 0;
+            for (uint8_t c : lps[i])
+            {
+                codeHist.inc_stats(c);
+                codeMax = max(codeMax, c);
+            }
+            if (codeMax >= 32)
+            {
+                hufChunk.emplace_back(codeHist, codeMax);
+                blkSize += min(hufChunk.back().estimate_size(), hufChunk.back().fallback_size());
+            }
+            else
+            {
+                fseChunk.emplace_back(codeHist, codeMax);
+                blkSize += min(fseChunk.back().estimate_size(), fseChunk.back().fallback_size());
+            }
+        }
+        if (blkSize < blkThres && blkSize < bestSize)
+        {
+            bestSize = blkSize;
+        }
+    }
     return flag;
 }
 
@@ -1788,38 +2163,25 @@ static vector<LZ3_match_info> LZ3_compress_opt(
 }
 
 template<typename ChunkType>
-static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<size_t>& pieces, const vector<ChunkType>& chunks, uint32_t uncompressIntercept, uint32_t uncompressThreshold)
+static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<ChunkType>& chunks, uint32_t uncompressIntercept, uint32_t uncompressThreshold)
 {
     uint8_t* flag = nullptr;
-    size_t pieceIdx = 0;
-    size_t chunkIdx = 0;
-    size_t pieceSize = pieces.empty() ? 0 : pieces[0];
-    size_t chunkSize = chunks.empty() ? 0 : chunks[0].codeHist.size();
     size_t rSize = 0;
-    while (pieceSize > 0 || chunkSize > 0)
+    for (const ChunkType& chunk : chunks)
     {
         *(flag = dst++) = (uint8_t)LZ3_stream_flag::None;
-        size_t pSize = min(pieceSize, chunkSize);
-        assert(pSize <= numeric_limits<uint16_t>::max());
-        rSize += pSize;
-        const ChunkType& chunk = chunks[chunkIdx];
+        size_t rSize = chunk.codeHist.size();
+        assert(rSize <= numeric_limits<uint16_t>::max());
         do
         {
-            if (chunkSize > pieceSize)
-            {
-                *flag |= (uint8_t)LZ3_stream_flag::MergedPiece;
-                LZ3_write_LE16(dst, (uint16_t)pSize);
-                break;
-            }
             size_t bSize = (rSize * chunk.codeBits + 3 + 1 + 7) / 8;
             if (chunk.hSize == 1 && chunk.cSize == 0)
             {
                 *flag |= (uint8_t)LZ3_stream_flag::RunLength;
-                LZ3_write_LE16(dst, (uint16_t)pSize);
+                LZ3_write_LE16(dst, (uint16_t)rSize);
                 *dst = chunk.header[0];
                 src += rSize;
                 dst += 1;
-                rSize = 0;
                 break;
             }
             if (chunk.estimate_size() + uncompressIntercept < chunk.fallback_size() * uncompressThreshold / 100)
@@ -1839,7 +2201,6 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
                             memcpy(dst, chunk.header, chunk.hSize);
                             src += rSize;
                             dst += cSize;
-                            rSize = 0;
                             break;
                         }
                     }
@@ -1856,11 +2217,10 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
                         {
                             *flag |= (uint8_t)LZ3_stream_flag::Huff0;
                             LZ3_write_LE16(dst, (uint16_t)cSize);
-                            LZ3_write_LE16(dst, (uint16_t)pSize);
+                            LZ3_write_LE16(dst, (uint16_t)rSize);
                             memcpy(dst, chunk.header, chunk.hSize);
                             src += rSize;
                             dst += cSize;
-                            rSize = 0;
                             break;
                         }
                     }
@@ -1882,29 +2242,17 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
                 LZ3_write_LE16(dst, (uint16_t)cSize);
                 src += rSize;
                 dst += cSize;
-                rSize = 0;
             }
             else
             {
                 *flag |= (uint8_t)LZ3_stream_flag::RawBytes;
-                LZ3_write_LE16(dst, (uint16_t)pSize);
+                LZ3_write_LE16(dst, (uint16_t)rSize);
                 memcpy(dst, src, rSize);
                 src += rSize;
                 dst += rSize;
-                rSize = 0;
             }
         }
         while (false);
-        pieceSize -= pSize;
-        chunkSize -= pSize;
-        if (pieceSize == 0 && pieceIdx < pieces.size() - 1)
-        {
-            pieceSize = pieces[++pieceIdx];
-        }
-        if (chunkSize == 0 && chunkIdx < chunks.size() - 1)
-        {
-            chunkSize = chunks[++chunkIdx].codeHist.size();
-        }
     }
     if (flag != nullptr)
     {
@@ -1918,39 +2266,31 @@ static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<siz
 
 static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, size_t srcSize, LZ3_entropy_coder coder, uint32_t uncompressIntercept, uint32_t uncompressThreshold)
 {
-    vector<size_t> pieces({ srcSize });
     if (coder == LZ3_entropy_coder::Huff0)
     {
         vector<LZ3_chunk_huf> chunks;
         chunks.emplace_back(src, srcSize);
-        LZ3_write_stream<LZ3_chunk_huf>(dst, src, pieces, chunks, uncompressIntercept, uncompressThreshold);
+        LZ3_write_stream<LZ3_chunk_huf>(dst, src, chunks, uncompressIntercept, uncompressThreshold);
         return;
     }
     if (coder == LZ3_entropy_coder::FSE)
     {
         vector<LZ3_chunk_fse> chunks;
         chunks.emplace_back(src, srcSize);
-        LZ3_write_stream<LZ3_chunk_fse>(dst, src, pieces, chunks, uncompressIntercept, uncompressThreshold);
+        LZ3_write_stream<LZ3_chunk_fse>(dst, src, chunks, uncompressIntercept, uncompressThreshold);
         return;
     }
 }
 
-const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, size_t* pieces)
+const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, size_t* chunks)
 {
     size_t rSize = 0;
-    size_t pieceIdx = 0;
+    size_t chunkIdx = 0;
     while (true)
     {
         uint8_t flag = *src++;
         do
         {
-            if (flag & (uint8_t)LZ3_stream_flag::MergedPiece)
-            {
-                size_t pSize = LZ3_read_LE16(src);
-                rSize += pSize;
-                pieces[pieceIdx++] = pSize;
-                break;
-            }
             if (flag & (uint8_t)LZ3_stream_flag::RawBytes)
             {
                 size_t pSize = LZ3_read_LE16(src);
@@ -1958,7 +2298,7 @@ const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, s
                 memcpy(dst, src, rSize);
                 src += rSize;
                 dst += rSize;
-                pieces[pieceIdx++] = pSize;
+                chunks[chunkIdx++] = pSize;
                 rSize = 0;
                 break;
             }
@@ -1977,7 +2317,7 @@ const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, s
                 size_t dSize = b - dst;
                 src += cSize;
                 dst += dSize;
-                pieces[pieceIdx++] = dSize - rSize;
+                chunks[chunkIdx++] = dSize - rSize;
                 rSize = 0;
                 break;
             }
@@ -1988,7 +2328,7 @@ const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, s
                 memset(dst, *src, rSize);
                 src += 1;
                 dst += rSize;
-                pieces[pieceIdx++] = pSize;
+                chunks[chunkIdx++] = pSize;
                 rSize = 0;
                 break;
             }
@@ -2005,7 +2345,7 @@ const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, s
                 }
                 src += cSize;
                 dst += dSize;
-                pieces[pieceIdx++] = pSize;
+                chunks[chunkIdx++] = pSize;
                 rSize = 0;
                 break;
             }
@@ -2020,7 +2360,7 @@ const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, s
                 }
                 src += cSize;
                 dst += dSize;
-                pieces[pieceIdx++] = dSize - rSize;
+                chunks[chunkIdx++] = dSize - rSize;
                 rSize = 0;
                 break;
             }
@@ -2031,7 +2371,7 @@ const size_t LZ3_read_stream(const uint8_t*& src, uint8_t* dst, size_t dstCap, s
             break;
         }
     }
-    return pieceIdx;
+    return chunkIdx;
 }
 
 static const uint8_t* LZ3_read_stream(const uint8_t*& src, uint8_t*& dst, size_t dstCap)
@@ -2424,7 +2764,6 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
     {
         vector<uint8_t> lrs; //literal raw stream
         vector<pair<uint32_t, uint32_t>> slices; //literal raw slices
-        vector<size_t> pieces; //literal raw pieces
         vector<LZ3_chunk_huf> chunks; //literal raw chunks
         vector<uint8_t> lls; //literal length stream
         vector<uint8_t> ofs; //match offset stream
@@ -2455,28 +2794,38 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
             slices.emplace_back(srcPos, literal);
             LZ3_encode_ll(lls, ext, literal);
         }
-        cctx.flag = cctx.flag | LZ3_detect_literal_flags(src, slices, cctx, lrs, pieces, chunks);
+        cctx.flag = cctx.flag | LZ3_detect_literal_flags(src, slices, cctx, lrs, chunks);
         uint8_t* dstPtr = dst;
         *dstPtr++ = (uint8_t)cctx.flag;
         if (cctx.flag & LZ3_compress_flag::OffsetBlock)
         {
             if (cctx.blockSize == (1u << cctx.blockLog))
             {
-                *dstPtr++ = (uint8_t)cctx.blockLog;
+                assert(cctx.blockLog < 16);
+                *dstPtr++ = (uint8_t)(cctx.blockLog & 0xF);
             }
             else
             {
-                *dstPtr++ = 0;
-                *dstPtr++ = (uint8_t)cctx.blockSize;
+                assert(cctx.blockSize < 16);
+                *dstPtr++ = (uint8_t)(cctx.blockSize << 4);
             }
         }
         if (cctx.flag & LZ3_compress_flag::OffsetTwoDim)
         {
             LZ3_write_LE16(dstPtr, (uint16_t)cctx.lineSize);
         }
+        if (cctx.flag & LZ3_compress_flag::LiteralBlock)
+        {
+            LZ3_write_LE16(dstPtr, cctx.blockLayout);
+        }
+        if (cctx.flag & LZ3_compress_flag::LiteralPredict)
+        {
+            LZ3_write_LE16(dstPtr, cctx.predictMask);
+            //TODO by Lysine select&record prdDis
+        }
         uint32_t lui = cctx.params[LZ3_compress_param::LitUncompressIntercept];
         uint32_t lut = cctx.params[LZ3_compress_param::LitUncompressThreshold];
-        LZ3_write_stream<LZ3_chunk_huf>(dstPtr, lrs.data(), pieces, chunks, lui, lut);
+        LZ3_write_stream<LZ3_chunk_huf>(dstPtr, lrs.data(), chunks, lui, lut);
         uint32_t sui = cctx.params[LZ3_compress_param::SeqUncompressIntercept];
         uint32_t sut = cctx.params[LZ3_compress_param::SeqUncompressThreshold];
         LZ3_write_stream(dstPtr, lls.data(), lls.size(), coder, sui, sut);
@@ -2575,96 +2924,6 @@ static void LZ3_safe_move(uint8_t* dst, uint8_t* dstEnd, uint8_t* dstShortEnd, c
 
 static constexpr uint32_t wild_copy_length = 16;
 
-#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
-static constexpr uint8_t periodic_seq[] = {
-    0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF,
-    0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF,
-};
-
-static constexpr uint8_t periodic_inc[] = {
-    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x0,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-    0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1, 0x1,
-};
-
-LZ3_FORCE_INLINE static uint8x16x4_t LZ3_reload8x4x16(const uint8_t* lrsPtr, uint16x8x2_t& lbsPosVec, uint8x16_t& lbsBufOff)
-{
-    uint8x16x4_t lbsBufVec;
-    lbsPosVec.val[0] = vaddw_u8(lbsPosVec.val[0], vget_low_u8(lbsBufOff));
-    uint32x4_t pos = vmovl_u16(vget_low_u16(lbsPosVec.val[0]));
-    uint32x4_t vld = vdupq_n_u32(0);
-    uint64x2_t poz = vreinterpretq_u64_u32(pos);
-    uint64_t po0 = vgetq_lane_u64(poz, 0);
-    uint64_t po1 = vgetq_lane_u64(poz, 1);
-    vld = vld1q_lane_u32(lrsPtr + (po0 & 0xFFFF), vld, 0);
-    vld = vld1q_lane_u32(lrsPtr + (po0 >> 32),    vld, 1);
-    vld = vld1q_lane_u32(lrsPtr + (po1 & 0xFFFF), vld, 2);
-    vld = vld1q_lane_u32(lrsPtr + (po1 >> 32),    vld, 3);
-    lbsBufVec.val[0] = vreinterpretq_u8_u32(vld);
-    pos = vmovl_high_u16(lbsPosVec.val[0]);
-    poz = vreinterpretq_u64_u32(pos);
-    po0 = vgetq_lane_u64(poz, 0);
-    po1 = vgetq_lane_u64(poz, 1);
-    vld = vld1q_lane_u32(lrsPtr + (po0 & 0xFFFF), vld, 0);
-    vld = vld1q_lane_u32(lrsPtr + (po0 >> 32),    vld, 1);
-    vld = vld1q_lane_u32(lrsPtr + (po1 & 0xFFFF), vld, 2);
-    vld = vld1q_lane_u32(lrsPtr + (po1 >> 32),    vld, 3);
-    lbsBufVec.val[1] = vreinterpretq_u8_u32(vld);
-    lbsPosVec.val[1] = vaddw_high_u8(lbsPosVec.val[1], lbsBufOff);
-    pos = vmovl_u16(vget_low_u16(lbsPosVec.val[1]));
-    poz = vreinterpretq_u64_u32(pos);
-    po0 = vgetq_lane_u64(poz, 0);
-    po1 = vgetq_lane_u64(poz, 1);
-    vld = vld1q_lane_u32(lrsPtr + (po0 & 0xFFFF), vld, 0);
-    vld = vld1q_lane_u32(lrsPtr + (po0 >> 32),    vld, 1);
-    vld = vld1q_lane_u32(lrsPtr + (po1 & 0xFFFF), vld, 2);
-    vld = vld1q_lane_u32(lrsPtr + (po1 >> 32),    vld, 3);
-    lbsBufVec.val[2] = vreinterpretq_u8_u32(vld);
-    pos = vmovl_high_u16(lbsPosVec.val[1]);
-    poz = vreinterpretq_u64_u32(pos);
-    po0 = vgetq_lane_u64(poz, 0);
-    po1 = vgetq_lane_u64(poz, 1);
-    vld = vld1q_lane_u32(lrsPtr + (po0 & 0xFFFF), vld, 0);
-    vld = vld1q_lane_u32(lrsPtr + (po0 >> 32),    vld, 1);
-    vld = vld1q_lane_u32(lrsPtr + (po1 & 0xFFFF), vld, 2);
-    vld = vld1q_lane_u32(lrsPtr + (po1 >> 32),    vld, 3);
-    lbsBufVec.val[3] = vreinterpretq_u8_u32(vld);
-    lbsBufOff = vdupq_n_u8(0);
-    return lbsBufVec;
-}
-
-#endif
-
 template<LZ3_entropy_coder coder, LZ3_history_pos hisPos>
 static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t dstSize, size_t preSize, const uint8_t* ext, size_t extSize)
 {
@@ -2683,10 +2942,9 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
 
     LZ3_DCtx dctx;
     LZ3_of_decoder decodeOfWrapper = nullptr;
+    LZ3_ls_decoder decodeLsWrapper = nullptr;
     uint8_t* buf = nullptr;
     const uint8_t* lrsPtr = nullptr; //literal raw stream
-    uint16_t lbsPos[16] = { 0 }; //literal block stream current position
-    uint32_t prdDis = 0;
     const uint8_t* llsPtr = nullptr; //literal length stream
     const uint8_t* ofsPtr = nullptr; //match offset stream
     const uint8_t* mlsPtr = nullptr; //match length stream
@@ -2701,19 +2959,19 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     else
     {
         dctx.flag = (LZ3_compress_flag)*srcPtr++;
-        dctx.blockSize = 0;
+        dctx.blockSize = 1;
         dctx.blockLog = 0;
         dctx.lineSize = 0;
         if (dctx.flag & LZ3_compress_flag::OffsetBlock)
         {
             dctx.blockLog = *srcPtr++;
-            if (dctx.blockLog != 0)
+            if (dctx.blockLog & 0xF)
             {
                 dctx.blockSize = 1u << dctx.blockLog;
             }
             else
             {
-                dctx.blockSize = *srcPtr++;
+                dctx.blockSize = dctx.blockLog >> 4;
                 dctx.blockLog = LZ3_HIGH_BIT_32(dctx.blockSize - 1) + 1;
             }
         }
@@ -2725,37 +2983,85 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         decodeOfWrapper = LZ3_gen_of_decoder(dctx.flag, dctx.blockSize, dctx.lineSize);
         buf = new uint8_t[dstSize * 4];
         uint8_t* bufPtr = buf;
+        uint16_t blockLayout = 0;
+        uint16_t predictMask = 0;
         if (dctx.flag & LZ3_compress_flag::LiteralBlock)
         {
-            size_t pieces[16] = { 0 };
-            size_t count = LZ3_read_stream(srcPtr, bufPtr, dstSize, pieces);
-            assert(count == 16);
-            (void)count;
+            blockLayout = LZ3_read_LE16(srcPtr);
+        }
+        if (dctx.flag & LZ3_compress_flag::LiteralPredict)
+        {
+            predictMask = LZ3_read_LE16(srcPtr);
+        }
+        if (dctx.flag & LZ3_compress_flag::LiteralBlock)
+        {
+            size_t chunks[16] = { 0 };
+            size_t count = LZ3_read_stream(srcPtr, bufPtr, dstSize, chunks);
             lrsPtr = bufPtr;
-            for (uint32_t i = 0; i < 16; ++i)
+            for (size_t i = 0; i < count; ++i)
             {
-                uint8_t mi = merge_idx[dctx.blockLog][i];
-                uintptr_t lbsIdx = (mi + (uintptr_t)dst) % 16;
-                lbsPos[lbsIdx] = (uint16_t)(bufPtr - lrsPtr);
-                bufPtr += pieces[i];
+                size_t size = chunks[i];
+                chunks[i] = bufPtr - lrsPtr;
+                bufPtr += size;
+            }
+            size_t blockEnd = dctx.blockSize;
+            if ((blockLayout & 1) == 0)
+            {
+                blockEnd += LZ3_HIGH_BIT_32(blockLayout);
+            }
+            uintptr_t dstOff = ((uintptr_t)dst) % dctx.blockSize;
+            size_t chunkIdx = count;
+            size_t blockLen = 0;
+            for (size_t i = 0; i < dctx.blockSize; ++i)
+            {
+                size_t blockIdx = (blockEnd - i - 1) % dctx.blockSize;
+                LZ3_block_stream& blockStr = dctx.blockStr[(blockIdx + dstOff) % dctx.blockSize];
+                blockStr.length = (uint16_t)(++blockLen);
+                blockStr.next = (uint16_t)((blockIdx + dstOff + blockLen) % dctx.blockSize);
+                if (blockLayout & (1 << blockIdx))
+                {
+                    blockStr.position = (uint16_t)(chunks[--chunkIdx]);
+                    blockLen = 0;
+                }
+                else
+                {
+                    blockStr.position = 0;
+                }
+            }
+            size_t blockHead = 0;
+            for (size_t i = 0; i < dctx.blockSize; ++i)
+            {
+                size_t blockIdx = (blockEnd + i) % dctx.blockSize;
+                if (blockLayout & (1 << blockIdx))
+                {
+                    blockHead = blockIdx;
+                }
+                LZ3_block_stream& blockStr = dctx.blockStr[(blockIdx + dstOff) % dctx.blockSize];
+                blockStr.head = (uint16_t)((blockHead + dstOff) % dctx.blockSize);
             }
         }
         else
         {
             lrsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
         }
+        dctx.predictMask = 0;
+        dctx.predictDis = 0;
         if (dctx.flag & LZ3_compress_flag::LiteralPredict)
         {
-            prdDis = 1;
+            uintptr_t dstOff = ((uintptr_t)dst) % dctx.blockSize;
+            dctx.predictMask = (predictMask << dstOff) & ((1 << dctx.blockSize) - 1) | (predictMask >> (dctx.blockSize - dstOff));
+            dctx.predictDis = 1;
             if (dctx.flag & LZ3_compress_flag::OffsetBlock)
             {
-                prdDis = dctx.blockSize;
+                dctx.predictDis = dctx.blockSize;
             }
-            /*if (dctx.flag & LZ3_compress_flag::OffsetTwoDim)
-            {
-                prdDis *= dctx.lineSize;
-            }*/
+            dctx.predictSta = dst + dctx.predictDis;
         }
+        else
+        {
+            dctx.predictSta = dst + dstSize;
+        }
+        decodeLsWrapper = gen_ls_decoder(dctx.flag, dctx.blockSize, blockLayout, dctx.predictMask, dctx.predictDis);
         llsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
         ofsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
         mlsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
@@ -2767,21 +3073,6 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
     uint8_t* dstPtr = dst;
     uint8_t* dstEnd = dstPtr + dstSize;
     uint8_t* dstShortEnd = dstEnd - wild_copy_length;
-#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
-    uint16x8x2_t lbsPosVec; //literal block stream current position
-    uint8x16x4_t lbsBufVec; //literal block stream buffer
-    uint8x16_t lbsBufOff; //literal block stream buffer offset
-    uint32_t lbsBufCnt; //literal block stream buffer read count
-    if (coder != LZ3_entropy_coder::None)
-    {
-        if (dctx.flag & LZ3_compress_flag::LiteralBlock)
-        {
-            lbsPosVec = vld1q_u16_x2(lbsPos);
-            lbsBufOff = vdupq_n_u8(0);
-            lbsBufCnt = 0;
-        }
-    }
-#endif
     while (true)
     {
         uint16_t token;
@@ -2811,52 +3102,15 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             }
             else
             {
-                if (dctx.flag & LZ3_compress_flag::LiteralBlock)
-                {
-#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
-                    if (literal > 0)
-                    {
-                        uint8x16_t seq = vld1q_u8(periodic_seq + (size_t)dstPtr % 16);
-                        if (lbsBufCnt == 0)
-                        {
-                            lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
-                            lbsBufCnt = 4;
-                        }
-                        uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
-                        uint8x16_t idx = vsliq_n_u8(off, seq, 2);
-                        uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
-                        vst1q_u8(dstPtr, top);
-                        uint8x16_t inc = vld1q_u8(periodic_inc + literal * 32 - (size_t)dstPtr % 16);
-                        lbsBufOff = vaddq_u8(lbsBufOff, inc);
-                        lbsBufCnt--;
-                    }
-#else
-                    uint8_t* cpyPtr = dstPtr;
-                    uint8_t* cpyEnd = dstPtr + literal;
-                    while (cpyPtr < cpyEnd)
-                    {
-                        uint16_t litPos = lbsPos[(uintptr_t)cpyPtr % 16]++;
-                        *cpyPtr++ = lrsPtr[litPos];
-                    }
-#endif
-                }
-                else
+                if (decodeLsWrapper == nullptr)
                 {
                     memcpy(dstPtr, lrsPtr, wild_copy_length);
                     lrsPtr += literal;
                 }
-                if (dctx.flag & LZ3_compress_flag::LiteralPredict)
+                else
                 {
-                    uint8_t* cpyPtr = dstPtr;
-                    uint8_t* cpyEnd = dstPtr + literal;
-                    while (cpyPtr < cpyEnd)
-                    {
-                        if (cpyPtr >= dst + prdDis)
-                        {
-                            *cpyPtr += *(cpyPtr - prdDis);
-                        }
-                        cpyPtr++;
-                    }
+                    auto result = decodeLsWrapper(dstPtr, lrsPtr, literal, dctx);
+                    lrsPtr = result.getSrcPtr(lrsPtr);
                 }
             }
             dstPtr += literal;
@@ -2888,66 +3142,15 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
             }
             else
             {
-                if (dctx.flag & LZ3_compress_flag::LiteralBlock)
-                {
-#if defined(__ARM_NEON) && !defined(LZ3_NO_SIMD)
-                    uint8x16_t seq = vld1q_u8(periodic_seq + (size_t)dstPtr % 16);
-                    while (literal >= 16)
-                    {
-                        if (lbsBufCnt == 0)
-                        {
-                            lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
-                            lbsBufCnt = 4;
-                        }
-                        uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
-                        uint8x16_t idx = vsliq_n_u8(off, seq, 2);
-                        uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
-                        vst1q_u8(dstPtr, top);
-                        dstPtr += 16;
-                        lbsBufOff = vaddq_u8(lbsBufOff, vdupq_n_u8(1));
-                        lbsBufCnt--;
-                        literal -= 16;
-                    }
-                    if (literal > 0)
-                    {
-                        if (lbsBufCnt == 0)
-                        {
-                            lbsBufVec = LZ3_reload8x4x16(lrsPtr, lbsPosVec, lbsBufOff);
-                            lbsBufCnt = 4;
-                        }
-                        uint8x16_t off = vqtbl1q_u8(lbsBufOff, seq);
-                        uint8x16_t idx = vsliq_n_u8(off, seq, 2);
-                        uint8x16_t top = vqtbl4q_u8(lbsBufVec, idx);
-                        vst1q_u8(dstPtr, top);
-                        uint8x16_t inc = vld1q_u8(periodic_inc + literal * 32 - (size_t)dstPtr % 16);
-                        lbsBufOff = vaddq_u8(lbsBufOff, inc);
-                        lbsBufCnt--;
-                    }
-#else
-                    uint8_t* cpyPtr = dstPtr;
-                    while (cpyPtr < cpyEnd)
-                    {
-                        uint16_t litPos = lbsPos[(uintptr_t)cpyPtr % 16]++;
-                        *cpyPtr++ = lrsPtr[litPos];
-                    }
-#endif
-                }
-                else
+                if (decodeLsWrapper == nullptr)
                 {
                     LZ3_safe_copy<wild_copy_length>(dstPtr, cpyEnd, dstShortEnd, lrsPtr);
                     lrsPtr += literal;
                 }
-                if (dctx.flag & LZ3_compress_flag::LiteralPredict)
+                else
                 {
-                    uint8_t* cpyPtr = dstPtr;
-                    while (cpyPtr < cpyEnd)
-                    {
-                        if (cpyPtr >= dst + prdDis)
-                        {
-                            *cpyPtr += *(cpyPtr - prdDis);
-                        }
-                        cpyPtr++;
-                    }
+                    auto result = decodeLsWrapper(dstPtr, lrsPtr, literal, dctx);
+                    lrsPtr = result.getSrcPtr(lrsPtr);
                 }
             }
             dstPtr += literal;

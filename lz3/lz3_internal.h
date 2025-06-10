@@ -5,6 +5,7 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #define LZ3_FORCE_INLINE      inline __attribute__((always_inline))
+#define LZ3_NO_INLINE         __attribute__((noinline))
 #define LZ3_ALIGNED(size)     __attribute__((aligned(size)))
 #define LZ3_LIKELY(expr)      (__builtin_expect(!!(expr), 1))
 #define LZ3_UNLIKELY(expr)    (__builtin_expect(!!(expr), 0))
@@ -12,6 +13,7 @@
 #define LZ3_HIGH_BIT_32(expr) ((uint8_t)(31 - __builtin_clz((uint32_t)(expr))))
 #elif defined(_MSC_VER)
 #define LZ3_FORCE_INLINE      __forceinline
+#define LZ3_NO_INLINE         __declspec(noinline)
 #define LZ3_ALIGNED(size)     __declspec(align(size))
 #define LZ3_UNREACHABLE       __assume(0)
 #include <intrin.h>
@@ -25,6 +27,9 @@ LZ3_FORCE_INLINE uint8_t LZ3_high_bit_32(uint32_t v)
 #endif
 #if !defined(LZ3_FORCE_INLINE)
 #define LZ3_FORCE_INLINE      inline
+#endif
+#if !defined(LZ3_NO_INLINE)
+#define LZ3_NO_INLINE
 #endif
 #if !defined(LZ3_ALIGNED)
 #define LZ3_ALIGNED(size)
@@ -142,4 +147,20 @@ LZ3_FORCE_INLINE static uint32_t LZ3_read_VL78(const uint8_t*& src, uint16_t tok
     {
         return dict[(token >> 8) & 0x7F];
     }
+}
+
+LZ3_FORCE_INLINE static uint32_t LZ3_extract_bits(const uint8_t* src, uint32_t offset, uint32_t length)
+{
+    uint32_t i = offset / 8;
+    uint32_t m = offset % 8;
+    uint32_t l = src[i++];
+    uint32_t r = 8;
+    l >>= m;
+    r -= m;
+    while (r < length)
+    {
+        l |= src[i++] << r;
+        r += 8;
+    }
+    return l;
 }
