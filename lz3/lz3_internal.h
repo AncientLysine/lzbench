@@ -10,20 +10,28 @@
 #define LZ3_LIKELY(expr)      (__builtin_expect(!!(expr), 1))
 #define LZ3_UNLIKELY(expr)    (__builtin_expect(!!(expr), 0))
 #define LZ3_UNREACHABLE       __builtin_unreachable()
-#define LZ3_HIGH_BIT_32(expr) ((uint8_t)(31 - __builtin_clz((uint32_t)(expr))))
+#define LZ3_CLZ_32(expr)      __builtin_clz((uint32_t)(expr))
+#define LZ3_CTZ_32(expr)      __builtin_ctz((uint32_t)(expr))
 #elif defined(_MSC_VER)
 #define LZ3_FORCE_INLINE      __forceinline
 #define LZ3_NO_INLINE         __declspec(noinline)
 #define LZ3_ALIGNED(size)     __declspec(align(size))
 #define LZ3_UNREACHABLE       __assume(0)
 #include <intrin.h>
-LZ3_FORCE_INLINE uint8_t LZ3_high_bit_32(uint32_t v)
+LZ3_FORCE_INLINE uint32_t LZ3_clz_32(uint32_t v)
 {
     unsigned long r;
     _BitScanReverse(&r, v);
-    return (uint8_t)r;
+    return (uint32_t)(31 - r);
 }
-#define LZ3_HIGH_BIT_32(expr) LZ3_high_bit_32((uint32_t)(expr))
+LZ3_FORCE_INLINE uint32_t LZ3_ctz_32(uint32_t v)
+{
+    unsigned long r;
+    _BitScanForward(&r, v);
+    return (uint32_t)r;
+}
+#define LZ3_CLZ_32(expr)      LZ3_clz_32((uint32_t)(expr))
+#define LZ3_CTZ_32(expr)      LZ3_ctz_32((uint32_t)(expr))
 #endif
 #if !defined(LZ3_FORCE_INLINE)
 #define LZ3_FORCE_INLINE      inline
@@ -52,19 +60,6 @@ LZ3_FORCE_INLINE uint8_t LZ3_high_bit_32(uint32_t v)
 #endif
 #if !defined(LZ3_UNREACHABLE)
 #define LZ3_UNREACHABLE
-#endif
-#if !defined(LZ3_HIGH_BIT_32)
-LZ3_FORCE_INLINE uint8_t LZ3_high_bit_32(uint32_t v)
-{
-    static constexpr uint8_t DeBruijnClz[32] = { 0, 9, 1, 10, 13, 21, 2, 29, 11, 14, 16, 18, 22, 25, 3, 30, 8, 12, 20, 28, 15, 17, 24, 7, 19, 27, 23, 6, 26, 5, 4, 31 };
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    return DeBruijnClz[(v * 0x07C4ACDDU) >> 27];
-}
-#define LZ3_HIGH_BIT_32(expr) LZ3_high_bit_32((uint32_t)(expr))
 #endif
 
 LZ3_FORCE_INLINE static void LZ3_write_LE16(uint8_t*& dst, uint16_t value)
@@ -147,6 +142,11 @@ LZ3_FORCE_INLINE static uint32_t LZ3_read_VL78(const uint8_t*& src, uint16_t tok
     {
         return dict[(token >> 8) & 0x7F];
     }
+}
+
+LZ3_FORCE_INLINE uint32_t LZ3_high_bit_32(uint32_t v)
+{
+    return 31 - LZ3_CLZ_32(v);
 }
 
 LZ3_FORCE_INLINE static uint32_t LZ3_extract_bits(const uint8_t* src, uint32_t offset, uint32_t length)
