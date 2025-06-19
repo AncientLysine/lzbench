@@ -1955,10 +1955,10 @@ static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vect
         {
             flag = flag | LZ3_compress_flag::LiteralPredict;
             bestSize = prdSize;
+            cctx.blockLayout = 0;
             if (prdChunks.size() > 1)
             {
                 flag = flag | LZ3_compress_flag::LiteralBlock;
-                cctx.blockLayout = 0;
                 for (size_t i = 0; i < prdSplits.size(); ++i)
                 {
                     if (prdSplits[i] != prdSplits[(i == 0 ? prdSplits.size() : i) - 1])
@@ -1966,6 +1966,10 @@ static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vect
                         cctx.blockLayout |= 1 << i;
                     }
                 }
+            }
+            else
+            {
+                flag = flag ^ LZ3_compress_flag::LiteralBlock;
             }
             vector<vector<uint8_t>> prdStreams(prdChunks.size());
             for (const auto& p : slices)
