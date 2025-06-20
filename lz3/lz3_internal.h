@@ -144,7 +144,7 @@ LZ3_FORCE_INLINE static uint32_t LZ3_read_VL78(const uint8_t*& src, uint16_t tok
     }
 }
 
-LZ3_FORCE_INLINE uint32_t LZ3_high_bit_32(uint32_t v)
+LZ3_FORCE_INLINE static uint32_t LZ3_high_bit_32(uint32_t v)
 {
     return 31 - LZ3_CLZ_32(v);
 }
@@ -162,5 +162,6 @@ LZ3_FORCE_INLINE static uint32_t LZ3_extract_bits(const uint8_t* src, uint32_t o
         l |= src[i++] << r;
         r += 8;
     }
+    l &= (1 << length) - 1;
     return l;
 }

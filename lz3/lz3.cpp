@@ -1758,43 +1758,312 @@ struct LZ3_chunk_pattern
     uint32_t quant;
     uint32_t count;
     uint32_t index;
-    uint8_t(*predict)(const uint8_t*, uint32_t);
 };
 
 struct LZ3_layout_pattern
 {
     vector<LZ3_chunk_pattern> chunks;
-    bool(*filter)(const uint8_t*);
 };
 
 struct LZ3_literal_pattern
 {
     uint32_t blockSize;
     vector<LZ3_layout_pattern> layouts;
+    uint32_t(*layoutSelector)(const uint8_t*, uint32_t);
 };
 
-static LZ3_literal_pattern lp_list[]
+struct LZ3_literal_params_BISE
 {
-    {8, {{{{8, 256, 3, 0}, {8, 256, 1, 1}, {8, 256, 4, 2}}}}},
-    {8, {{{{8, 256, 3, 0}, {8, 256, 1, 1}, {8, 256, 2, 2}, {8, 256, 2, 3}}}}},
-    {8, {{{{8, 256, 3, 0, [](const uint8_t* s, uint32_t o) { return (uint8_t)(o >= 64 ? s[(o - 64) / 8] : 0); }}, {8, 256, 1, 1}, {8, 256, 4, 2}}}}},
-    {8, {{{{8, 256, 3, 0, [](const uint8_t* s, uint32_t o) { return (uint8_t)(o >= 64 ? s[(o - 64) / 8] : 0); }}, {8, 256, 1, 1}, {8, 256, 2, 2}, {8, 256, 2, 3}}}}},
-    //{8, {{{{8, 256, 3, 0}, {3, 8, 2, 1}, {2, 4, 1, 2}, {8, 256, 4, 3}}}}},
-    //{8, {{{{8, 256, 3, 0}, {3, 8, 2, 1}, {2, 4, 1, 2}, {8, 256, 2, 3}, {8, 256, 2, 4}}}}},
-    //{8, {{{{8, 256, 3, 0}, {3, 8, 2, 1}, {2, 4, 1, 2}, {1, 2, 32, 3}}}}},
-    //{8, {{{{8, 256, 3, 0}, {3, 8, 2, 1}, {2, 4, 1, 2}, {1, 2, 16, 3}, {1, 2, 16, 4}}}}},
+    uint32_t trits;
+    uint32_t qunits;
+    uint32_t bits;
+};
+
+struct LZ3_literal_params_ASTC
+{
+    bool voidExt;
+    LZ3_literal_params_BISE weightEncoding;
+    uint32_t weightWidth;
+    uint32_t weightHeight;
+    uint32_t weightSta;
+    bool dualPanel;
+    uint32_t part;
+    uint32_t colorModes[4];
+    uint32_t colorSta;
+    uint32_t colorExtraSta;
+};
+
+static bool LZ3_parse_params_ASTC(const uint8_t* b, LZ3_literal_params_ASTC& p)
+{
+    memset(&p, 0, sizeof(LZ3_literal_params_ASTC));
+    uint32_t blockMode = 0;
+    uint32_t weightRange = 0;
+    uint32_t b01 = LZ3_extract_bits(b, 0, 2);
+    if (b01 != 0)
     {
-        16,
+        blockMode = LZ3_extract_bits(b, 2, 2);
+        if (blockMode == 3)
         {
-            {{{8, 256, 1, 0}, {8, 256, 1, 1}, {8, 256, 1, 2}, {8, 256, 4, 3}, {8, 256, 9, 4}}}
+            blockMode += LZ3_extract_bits(b, 8, 1);
+        }
+        weightRange = (b01 << 1) | LZ3_extract_bits(b, 4, 1);
+    }
+    else
+    {
+        uint32_t b78 = LZ3_extract_bits(b, 7, 2);
+        if (b78 <= 1)
+        {
+            blockMode = 5 + b78;
+        }
+        if (b78 == 3)
+        {
+            uint32_t b56 = LZ3_extract_bits(b, 5, 2);
+            if (b56 <= 1)
+            {
+                blockMode = 5 + b78 + b56;
+            }
+            else if (LZ3_extract_bits(b, 2, 5) == 31)
+            {
+                blockMode = 10;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        if (b78 == 2)
+        {
+            blockMode = 9;
+        }
+        uint32_t b23 = LZ3_extract_bits(b, 2, 2);
+        if (b23 == 0)
+        {
+            return false;
+        }
+        weightRange = (b23 << 1) | LZ3_extract_bits(b, 4, 1);
+    }
+    uint32_t weightPrecision = blockMode < 9 ? LZ3_extract_bits(b, 9, 1) : 0;
+    static constexpr LZ3_literal_params_BISE weightEncoding[2][8] = {
+        {
+            {0, 0, 0},
+            {0, 0, 0},
+            {0, 0, 1},
+            {1, 0, 0},
+            {0, 0, 2},
+            {0, 1, 0},
+            {1, 0, 1},
+            {0, 0, 3},
+        },
+        {
+            {0, 0, 0},
+            {0, 0, 0},
+            {0, 1, 1},
+            {1, 0, 2},
+            {0, 0, 4},
+            {0, 1, 2},
+            {1, 0, 3},
+            {0, 0, 5},
+        }
+    };
+    p.weightEncoding = weightEncoding[weightPrecision][weightRange];
+    switch (blockMode)
+    {
+    case 0:
+        p.weightWidth = LZ3_extract_bits(b, 7, 2) + 4;
+        p.weightHeight = LZ3_extract_bits(b, 5, 2) + 2;
+        break;
+    case 1:
+        p.weightWidth = LZ3_extract_bits(b, 7, 2) + 8;
+        p.weightHeight = LZ3_extract_bits(b, 5, 2) + 2;
+        break;
+    case 2:
+        p.weightWidth = LZ3_extract_bits(b, 5, 2) + 2;
+        p.weightHeight = LZ3_extract_bits(b, 7, 2) + 8;
+        break;
+    case 3:
+        p.weightWidth = LZ3_extract_bits(b, 5, 2) + 2;
+        p.weightHeight = LZ3_extract_bits(b, 7, 1) + 6;
+        break;
+    case 4:
+        p.weightWidth = LZ3_extract_bits(b, 7, 1) + 2;
+        p.weightHeight = LZ3_extract_bits(b, 5, 2) + 2;
+        break;
+    case 5:
+        p.weightWidth = 12;
+        p.weightHeight = LZ3_extract_bits(b, 5, 2) + 2;
+        break;
+    case 6:
+        p.weightWidth = LZ3_extract_bits(b, 5, 2) + 2;
+        p.weightHeight = 12;
+        break;
+    case 7:
+        p.weightWidth = 6;
+        p.weightHeight = 10;
+        break;
+    case 8:
+        p.weightWidth = 10;
+        p.weightHeight = 6;
+        break;
+    case 9:
+        p.weightWidth = LZ3_extract_bits(b, 9, 2) + 6;
+        p.weightHeight = LZ3_extract_bits(b, 5, 2) + 6;
+        break;
+    case 10:
+        p.voidExt = true;
+        return true;
+    }
+    uint32_t weightCount = p.weightWidth * p.weightHeight;
+    if (weightCount > 64)
+    {
+        return false;
+    }
+    uint32_t weightBits;
+    if (p.weightEncoding.trits)
+    {
+        weightBits = (weightCount + 4) / 5 * (5 * p.weightEncoding.bits + 8 * p.weightEncoding.trits);
+    }
+    else
+    {
+        weightBits = (weightCount + 2) / 3 * (3 * p.weightEncoding.bits + 7 * p.weightEncoding.qunits);
+    }
+    if (weightBits > 96 || weightBits < 24)
+    {
+        return false;
+    }
+    p.weightSta = 128 - weightBits;
+    p.dualPanel = blockMode < 9 ? LZ3_extract_bits(b, 10, 1) : 0;
+    p.part = LZ3_extract_bits(b, 11, 2);
+    if (p.dualPanel && p.part >= 3)
+    {
+        return false;
+    }
+    if (p.part == 0)
+    {
+        p.colorModes[0] = LZ3_extract_bits(b, 13, 4);
+        p.colorExtraSta = p.weightSta;
+        p.colorSta = 17;
+    }
+    else
+    {
+        uint32_t b2324 = LZ3_extract_bits(b, 23, 2);
+        if (b2324 == 0)
+        {
+            fill_n(p.colorModes, 4, LZ3_extract_bits(b, 25, 4));
+        }
+        else
+        {
+            switch (p.part)
+            {
+            case 1:
+                p.colorModes[0] = (b2324 - 1 + LZ3_extract_bits(b, 25, 1)) * 4 + LZ3_extract_bits(b, 27, 2);
+                p.colorModes[1] = (b2324 - 1 + LZ3_extract_bits(b, 26, 1)) * 4 + LZ3_extract_bits(b, p.weightSta - 1, 2);
+                p.colorExtraSta = p.weightSta - 2;
+                break;
+            case 2:
+                p.colorModes[0] = (b2324 - 1 + LZ3_extract_bits(b, 25, 1)) * 4 + LZ3_extract_bits(b, 28, 1) + LZ3_extract_bits(b, p.weightSta - 4, 1) * 2;
+                p.colorModes[1] = (b2324 - 1 + LZ3_extract_bits(b, 26, 1)) * 4 + LZ3_extract_bits(b, p.weightSta - 3, 2);
+                p.colorModes[2] = (b2324 - 1 + LZ3_extract_bits(b, 27, 1)) * 4 + LZ3_extract_bits(b, p.weightSta - 1, 2);
+                p.colorExtraSta = p.weightSta - 5;
+                break;
+            case 3:
+                p.colorModes[0] = (b2324 - 1 + LZ3_extract_bits(b, 25, 1)) * 4 + LZ3_extract_bits(b, p.weightSta - 7, 2);
+                p.colorModes[1] = (b2324 - 1 + LZ3_extract_bits(b, 26, 1)) * 4 + LZ3_extract_bits(b, p.weightSta - 5, 2);
+                p.colorModes[2] = (b2324 - 1 + LZ3_extract_bits(b, 27, 1)) * 4 + LZ3_extract_bits(b, p.weightSta - 3, 2);
+                p.colorModes[3] = (b2324 - 1 + LZ3_extract_bits(b, 28, 1)) * 4 + LZ3_extract_bits(b, p.weightSta - 1, 2);
+                p.colorExtraSta = p.weightSta - 8;
+                break;
+            }
+        }
+        p.colorSta = 29;
+    }
+    return true;
+}
+
+struct LZ3_literal_pattern_statistic
+{
+    struct
+    {
+        vector<uint32_t> illegal;
+        std::unordered_map<uint32_t, uint32_t> weightSta;
+        uint32_t dualPanel[2];
+        uint32_t part[4];
+        uint32_t colorMode[16];
+        std::unordered_map<uint32_t, uint32_t> colorSta;
+    }ASTC;
+
+    void clear()
+    {
+        ASTC.illegal.clear();
+        ASTC.weightSta.clear();
+        fill_n(ASTC.dualPanel, 2, 0);
+        fill_n(ASTC.part, 4, 0);
+        fill_n(ASTC.colorMode, 16, 0);
+        ASTC.colorSta.clear();
+    }
+};
+
+static LZ3_literal_pattern_statistic LZ3_literal_pattern_sta;
+
+static uint32_t LZ3_select_layout_ASTC(const uint8_t* b, uint32_t o)
+{
+    LZ3_literal_params_ASTC params;
+    if (!LZ3_parse_params_ASTC(b + o, params))
+    {
+#if defined(LZ3_LIT_STA)
+        LZ3_literal_pattern_sta.ASTC.illegal.push_back(o);
+#endif
+        return 0;
+    }
+#if defined(LZ3_LIT_STA)
+    if (!params.voidExt)
+    {
+        LZ3_literal_pattern_sta.ASTC.weightSta[params.weightSta]++;
+        LZ3_literal_pattern_sta.ASTC.dualPanel[params.dualPanel]++;
+        LZ3_literal_pattern_sta.ASTC.part[params.part]++;
+        for (uint32_t i = 0; i <= params.part; ++i)
+        {
+            LZ3_literal_pattern_sta.ASTC.colorMode[params.colorModes[i]]++;
+        }
+        LZ3_literal_pattern_sta.ASTC.colorSta[params.colorSta]++;
+    }
+#endif
+    if (params.part > 1)
+    {
+        return 1;
+    }
+    else
+    {
+        return 2;
+    }
+}
+
+static LZ3_literal_pattern lp_list[] = {
+    /*{
+        8,
+        {
+            {{{8, 256, 3, 0}, {8, 256, 1, 1}, {8, 256, 4, 2}}}
+        }
+    },
+    {
+        8,
+        {
+            {{{8, 256, 3, 0}, {8, 256, 1, 1}, {8, 256, 2, 2}, {8, 256, 2, 3}}}
         }
     },
     {
         16,
         {
-            {{{8, 256, 1, 0}, {8, 256, 1, 1}, {8, 256, 4, 3}, {8, 256, 10, 5}}, [](const uint8_t* b) { return (b[1] & 0b11000) == 0; }},
-            {{{8, 256, 1, 0}, {8, 256, 1, 1}, {8, 256, 1, 2}, {8, 256, 4, 4}, {8, 256, 9, 5}}, [](const uint8_t* b) { return (b[1] & 0b11000) != 0; }}
+            {{{8, 256, 1, 0}, {8, 256, 1, 1}, {8, 256, 1, 2}, {8, 256, 4, 3}, {8, 256, 9, 4}}}
         }
+    },*/
+    {
+        16,
+        {
+            {{{8, 256, 16, 0}}},
+            {{{8, 256, 1, 1}, {8, 256, 1, 2}, {8, 256, 4, 4}, {8, 256, 10, 6}}},
+            {{{8, 256, 1, 1}, {8, 256, 1, 2}, {8, 256, 1, 3}, {8, 256, 4, 5}, {8, 256, 9, 6}}}
+        },
+        &LZ3_select_layout_ASTC
     },
 };
 
@@ -1837,7 +2106,7 @@ static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vect
         vector<LZ3_chunk_huf> blkChunks;
         for (uint32_t i = 0; i < cctx.blockSize; ++i)
         {
-            blkChunks.emplace_back(blkHist[i], 255);
+            blkChunks.emplace_back(blkHist[i], (uint8_t)255);
         }
         vector<uint8_t> blkSplits = LZ3_merge_chunks(blkChunks);
         if (blkChunks.size() == 1)
@@ -1931,11 +2200,11 @@ static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vect
         {
             if (cctx.predictMask & (1 << i))
             {
-                prdChunks.emplace_back(prdHist[i], 255);
+                prdChunks.emplace_back(prdHist[i], (uint8_t)255);
             }
             else
             {
-                prdChunks.emplace_back(blkHist[i], 255);
+                prdChunks.emplace_back(blkHist[i], (uint8_t)255);
             }
         }
         vector<uint8_t> prdSplits;
@@ -2009,73 +2278,87 @@ static LZ3_compress_flag LZ3_detect_literal_flags(const uint8_t* src, const vect
                 maxIndex = max(maxIndex, cp.index);
             }
         }
-        vector<vector<uint8_t>> lps(maxIndex + 1);
-        for (const auto& p : slices)
+        for (uint32_t blkOff = 0; blkOff < lp.blockSize; ++blkOff)
         {
-            uint32_t blkSta = p.first - p.first % lp.blockSize;
-            for (const LZ3_layout_pattern& ap : lp.layouts)
+            LZ3_literal_pattern_sta.clear();
+            vector<vector<uint8_t>> lps(maxIndex + 1);
+            for (const auto& p : slices)
             {
-                if (ap.filter == nullptr || ap.filter(src + blkSta))
+                if (p.second == 0)
                 {
-                    uint32_t bitOff = blkSta * 8; //bit offset
-                    uint32_t bitSta = p.first * 8; //bit start
-                    uint32_t bitEnd = bitSta + p.second * 8; //bit end
-                    for (uint32_t j = 0; ; j = (j + 1) % ap.chunks.size())
+                    continue;
+                }
+                uint32_t idxPos = p.first;
+                uint32_t idxOff = (idxPos - blkOff) % lp.blockSize;
+                uint32_t layoutIdx = 0;
+                if (lp.layoutSelector != nullptr && idxPos >= idxOff)
+                {
+                    layoutIdx = lp.layoutSelector(src, idxPos - idxOff);
+                }
+                uint32_t bitPos = idxPos * 8;
+                uint32_t bitEnd = bitPos + p.second * 8;
+                while (true)
+                {
+                    uint32_t bitOff = idxOff * 8;
+                    for (const LZ3_chunk_pattern& cp : lp.layouts[layoutIdx].chunks)
                     {
-                        const LZ3_chunk_pattern& cp = ap.chunks[j];
-                        for (uint32_t k = 0; k < cp.count; ++k)
+                        for (uint32_t i = 0; i < cp.count; ++i)
                         {
-                            if (bitOff + cp.bits <= bitSta)
+                            if (bitOff >= cp.bits)
                             {
-                                bitOff += cp.bits;
+                                bitOff -= cp.bits;
                                 continue;
                             }
-                            if (bitOff < bitEnd)
+                            uint32_t l = LZ3_extract_bits(src, bitPos - bitOff, cp.bits);
+                            lps[cp.index].push_back((uint8_t)l);
+                            bitPos += cp.bits - bitOff;
+                            bitOff = 0;
+                            if (bitPos >= bitEnd)
                             {
-                                uint32_t l = LZ3_extract_bits(src, bitOff, cp.bits);
-                                if (cp.predict != nullptr)
-                                {
-                                    l -= cp.predict(src, bitOff);
-                                }
-                                lps[cp.index].push_back(l % cp.quant);
-                                bitOff += cp.bits;
+                                break;
                             }
                         }
-                        if (bitOff >= bitEnd)
-                        {
-                            break;
-                        }
                     }
-                    break;
+                    if (bitPos >= bitEnd)
+                    {
+                        break;
+                    }
+                    assert(bitPos % 8 == 0);
+                    idxPos = bitPos / 8;
+                    idxOff = (idxPos - blkOff) % lp.blockSize;
+                    if (lp.layoutSelector != nullptr && idxPos >= idxOff)
+                    {
+                        layoutIdx = lp.layoutSelector(src, idxPos - idxOff);
+                    }
                 }
             }
-        }
-        vector<LZ3_chunk_huf> hufChunk;
-        vector<LZ3_chunk_fse> fseChunk;
-        int64_t blkSize = 0;
-        for (uint32_t i = 0; i <= maxIndex; ++i)
-        {
-            LZ3_code_hist codeHist;
-            uint8_t codeMax = 0;
-            for (uint8_t c : lps[i])
+            vector<LZ3_chunk_huf> hufChunk;
+            vector<LZ3_chunk_fse> fseChunk;
+            int64_t blkSize = 0;
+            for (uint32_t i = 0; i <= maxIndex; ++i)
             {
-                codeHist.inc_stats(c);
-                codeMax = max(codeMax, c);
+                LZ3_code_hist codeHist;
+                uint8_t codeMax = 0;
+                for (uint8_t c : lps[i])
+                {
+                    codeHist.inc_stats(c);
+                    codeMax = max(codeMax, c);
+                }
+                if (codeMax >= 32)
+                {
+                    hufChunk.emplace_back(codeHist, codeMax);
+                    blkSize += min(hufChunk.back().estimate_size(), hufChunk.back().fallback_size());
+                }
+                else if (codeMax >= 1)
+                {
+                    fseChunk.emplace_back(codeHist, codeMax);
+                    blkSize += min(fseChunk.back().estimate_size(), fseChunk.back().fallback_size());
+                }
             }
-            if (codeMax >= 32)
+            if (blkSize < blkThres && blkSize < bestSize)
             {
-                hufChunk.emplace_back(codeHist, codeMax);
-                blkSize += min(hufChunk.back().estimate_size(), hufChunk.back().fallback_size());
+                bestSize = blkSize;
             }
-            else
-            {
-                fseChunk.emplace_back(codeHist, codeMax);
-                blkSize += min(fseChunk.back().estimate_size(), fseChunk.back().fallback_size());
-            }
-        }
-        if (blkSize < blkThres && blkSize < bestSize)
-        {
-            bestSize = blkSize;
         }
     }
     return flag;
