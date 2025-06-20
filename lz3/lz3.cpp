@@ -596,8 +596,8 @@ struct LZ3_CCtx
             uint8_t of_bits[64];
             uint8_t of_size;
             uint32_t preOff[3];
-            uint16_t blockLayout;
-            uint16_t predictMask;
+            uint32_t blockLayout;
+            uint32_t predictMask;
         };
     };
 };
@@ -1183,7 +1183,7 @@ static LZ3_decode_ls_result LZ3_decode_ls_block_wild_predict_conti_wrapper(uint8
 
 typedef LZ3_decode_ls_result(*LZ3_ls_decoder)(uint8_t* dstPtr, const uint8_t* srcPtr, size_t literal, LZ3_DCtx& dctx);
 
-LZ3_NO_INLINE static LZ3_ls_decoder gen_ls_decoder(LZ3_compress_flag flag, uint32_t blockSize, uint16_t blockLayout, uint16_t predictMask, uint32_t predictDis)
+LZ3_NO_INLINE static LZ3_ls_decoder gen_ls_decoder(LZ3_compress_flag flag, uint32_t blockSize, uint32_t blockLayout, uint32_t predictMask, uint32_t predictDis)
 {
     uint32_t predictLen = 0;
     for (uint32_t i = 0; i < blockSize; ++i)
@@ -1192,6 +1192,17 @@ LZ3_NO_INLINE static LZ3_ls_decoder gen_ls_decoder(LZ3_compress_flag flag, uint3
         {
             ++predictLen;
         }
+    }
+    bool predictConti = false;
+    predictMask = (predictMask << blockSize) | predictMask;
+    for (uint32_t i = 0; i < blockSize; ++i)
+    {
+        uint32_t m = (1 << predictLen) - 1;
+        if ((predictMask & m) == m)
+        {
+            predictConti = true;
+        }
+        predictMask >>= 1;
     }
     switch ((uint8_t)flag & 24)
     {
@@ -1210,15 +1221,15 @@ LZ3_NO_INLINE static LZ3_ls_decoder gen_ls_decoder(LZ3_compress_flag flag, uint3
     case 16:
         return &LZ3_decode_ls_predict_wrapper<0, 0>;
     case 24:
-        if (blockSize == 8  && predictLen == 3 && predictDis == 8)
+        if (blockSize == 8  && predictConti && predictLen == 3 && predictDis == 8)
             return &LZ3_decode_ls_block_wild_predict_conti_wrapper<8,  8,  3, 8>;
-        if (blockSize == 16 && predictLen == 1 && predictDis == 16)
+        if (blockSize == 16 && predictConti && predictLen == 1 && predictDis == 16)
             return &LZ3_decode_ls_block_wild_predict_conti_wrapper<16, 16, 1, 16>;
-        if (blockSize == 16 && predictLen == 2 && predictDis == 16)
+        if (blockSize == 16 && predictConti && predictLen == 2 && predictDis == 16)
             return &LZ3_decode_ls_block_wild_predict_conti_wrapper<16, 16, 2, 16>;
-        if (blockSize == 16 && predictLen == 3 && predictDis == 16)
+        if (blockSize == 16 && predictConti && predictLen == 3 && predictDis == 16)
             return &LZ3_decode_ls_block_wild_predict_conti_wrapper<16, 16, 3, 16>;
-        if (blockSize == 16 && predictLen == 4 && predictDis == 16)
+        if (blockSize == 16 && predictConti && predictLen == 4 && predictDis == 16)
             return &LZ3_decode_ls_block_wild_predict_conti_wrapper<16, 16, 4, 16>;
         if (blockSize == 8  && predictDis == 8)
             return &LZ3_decode_ls_block_wild_predict_wrapper<8,  8,  8>;
@@ -2926,15 +2937,18 @@ static size_t LZ3_compress_generic(const uint8_t* src, uint8_t* dst, size_t srcS
         }
         if (cctx.flag & LZ3_compress_flag::OffsetTwoDim)
         {
+            assert(cctx.lineSize <= numeric_limits<uint16_t>::max());
             LZ3_write_LE16(dstPtr, (uint16_t)cctx.lineSize);
         }
         if (cctx.flag & LZ3_compress_flag::LiteralBlock)
         {
-            LZ3_write_LE16(dstPtr, cctx.blockLayout);
+            assert(cctx.lineSize <= numeric_limits<uint16_t>::max());
+            LZ3_write_LE16(dstPtr, (uint16_t)cctx.blockLayout);
         }
         if (cctx.flag & LZ3_compress_flag::LiteralPredict)
         {
-            LZ3_write_LE16(dstPtr, cctx.predictMask);
+            assert(cctx.lineSize <= numeric_limits<uint16_t>::max());
+            LZ3_write_LE16(dstPtr, (uint16_t)cctx.predictMask);
             //TODO by Lysine select&record prdDis
         }
         uint32_t lui = cctx.params[LZ3_compress_param::LitUncompressIntercept];
@@ -3097,8 +3111,8 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         decodeOfWrapper = LZ3_gen_of_decoder(dctx.flag, dctx.blockSize, dctx.lineSize);
         buf = new uint8_t[dstSize * 4];
         uint8_t* bufPtr = buf;
-        uint16_t blockLayout = 0;
-        uint16_t predictMask = 0;
+        uint32_t blockLayout = 0;
+        uint32_t predictMask = 0;
         if (dctx.flag & LZ3_compress_flag::LiteralBlock)
         {
             blockLayout = LZ3_read_LE16(srcPtr);
@@ -3176,7 +3190,7 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         {
             dctx.predictSta = dst + dstSize;
         }
-        decodeLsWrapper = gen_ls_decoder(dctx.flag, dctx.blockSize, blockLayout, dctx.predictMask, dctx.predictDis);
+        decodeLsWrapper = gen_ls_decoder(dctx.flag, dctx.blockSize, blockLayout, predictMask, dctx.predictDis);
         llsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
         ofsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
         mlsPtr = LZ3_read_stream(srcPtr, bufPtr, dstSize);
