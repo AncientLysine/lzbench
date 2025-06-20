@@ -1242,21 +1242,8 @@ LZ3_NO_INLINE static LZ3_ls_decoder gen_ls_decoder(LZ3_compress_flag flag, uint3
     return nullptr;
 }
 
-static void LZ3_safe_decode_ls(LZ3_ls_decoder decoder, uint8_t* dstPtr, uint8_t* dstEnd, uint8_t* dstShortEnd, const uint8_t*& srcPtr, LZ3_DCtx& dctx)
+LZ3_NO_INLINE static LZ3_decode_ls_result LZ3_decode_ls_safe(uint8_t* dstPtr, const uint8_t* srcPtr, size_t literal, LZ3_DCtx& dctx)
 {
-    if (dstEnd <= dstShortEnd)
-    {
-        auto result = decoder(dstPtr, srcPtr, dstEnd - dstPtr, dctx);
-        srcPtr = result.getSrcPtr(srcPtr);
-        return;
-    }
-    if (dstPtr < dstShortEnd)
-    {
-        auto result = decoder(dstPtr, srcPtr, dstShortEnd - dstPtr, dctx);
-        srcPtr = result.getSrcPtr(srcPtr);
-        dstPtr = dstShortEnd;
-    }
-    size_t literal = dstEnd - dstPtr;
     if (dctx.flag & LZ3_compress_flag::LiteralBlock && dctx.flag & LZ3_compress_flag::LiteralPredict)
     {
         LZ3_decode_ls_block<0>(dstPtr, literal, dctx, [=](uint8_t* cpyPtr, size_t srcPos, size_t cpyLen)
@@ -1288,6 +1275,9 @@ static void LZ3_safe_decode_ls(LZ3_ls_decoder decoder, uint8_t* dstPtr, uint8_t*
             [=, &srcPtr](uint8_t* cpyPtr) { *cpyPtr = *(srcPtr++) + *(cpyPtr - d); },
             [=, &srcPtr](uint8_t* cpyPtr) { *cpyPtr = *(srcPtr++); });
     }
+    LZ3_decode_ls_result result;
+    result.setSrcPtr(srcPtr);
+    return result;
 }
 
 #define LZ3_BIT_COST_ACC 8u
@@ -2291,7 +2281,6 @@ template<typename ChunkType>
 static void LZ3_write_stream(uint8_t*& dst, const uint8_t* src, const vector<ChunkType>& chunks, uint32_t uncompressIntercept, uint32_t uncompressThreshold)
 {
     uint8_t* flag = nullptr;
-    size_t rSize = 0;
     for (const ChunkType& chunk : chunks)
     {
         *(flag = dst++) = (uint8_t)LZ3_stream_flag::None;
@@ -3219,27 +3208,37 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
         }
         if LZ3_LIKELY(literal <= min(wild_copy_length, coder == LZ3_entropy_coder::None ? 0xEu : 0xFu))
         {
-            if LZ3_UNLIKELY(dstPtr >= dstShortEnd)
-            {
-                goto safe_copy_literal;
-            }
+            uint8_t* cpyEnd = dstPtr + literal;
+            assert(cpyEnd <= dstEnd);
             //TODO by Lysine: copy literal may read beyond source/stream end
             if (coder == LZ3_entropy_coder::None)
             {
+                if LZ3_UNLIKELY(dstPtr >= dstShortEnd)
+                {
+                    goto safe_copy_literal;
+                }
                 memcpy(dstPtr, srcPtr, wild_copy_length);
                 srcPtr += literal;
             }
             else if (decodeLsWrapper == nullptr)
             {
+                if LZ3_UNLIKELY(dstPtr >= dstShortEnd)
+                {
+                    goto safe_copy_literal;
+                }
                 memcpy(dstPtr, lrsPtr, wild_copy_length);
                 lrsPtr += literal;
             }
             else
             {
-                auto result = decodeLsWrapper(dstPtr, lrsPtr, literal, dctx);
+                if LZ3_UNLIKELY(cpyEnd >= dstShortEnd)
+                {
+                    goto safe_copy_literal;
+                }
+                LZ3_decode_ls_result result = decodeLsWrapper(dstPtr, lrsPtr, literal, dctx);
                 lrsPtr = result.getSrcPtr(lrsPtr);
             }
-            dstPtr += literal;
+            dstPtr = cpyEnd;
         }
         else
         {
@@ -3271,11 +3270,24 @@ static size_t LZ3_decompress_generic(const uint8_t* src, uint8_t* dst, size_t ds
                 LZ3_safe_copy<wild_copy_length>(dstPtr, cpyEnd, dstShortEnd, lrsPtr);
                 lrsPtr += literal;
             }
+            else if (cpyEnd <= dstShortEnd)
+            {
+                LZ3_decode_ls_result result = decodeLsWrapper(dstPtr, lrsPtr, literal, dctx);
+                lrsPtr = result.getSrcPtr(srcPtr);
+            }
             else
             {
-                LZ3_safe_decode_ls(decodeLsWrapper, dstPtr, cpyEnd, dstShortEnd, lrsPtr, dctx);
+                LZ3_decode_ls_result result;
+                if (dstPtr < dstShortEnd)
+                {
+                    result = decodeLsWrapper(dstPtr, lrsPtr, dstShortEnd - dstPtr, dctx);
+                    lrsPtr = result.getSrcPtr(lrsPtr);
+                    dstPtr = dstShortEnd;
+                }
+                result = LZ3_decode_ls_safe(dstPtr, lrsPtr, cpyEnd - dstPtr, dctx);
+                lrsPtr = result.getSrcPtr(lrsPtr);
             }
-            dstPtr += literal;
+            dstPtr = cpyEnd;
             if (dstPtr >= dstEnd)
             {
                 break;
